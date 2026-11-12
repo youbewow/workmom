@@ -77,8 +77,35 @@ def _active_model():
     return "kimi-k3.1-pro"
 
 
-DEFAULT_MODEL = WM.active_model()        # 仅作兜底，真正生效的是 _active_model()
+# ----------------------------------------------------------------------------
+# 读 config.json —— 陌生机器上唯一需要改的就是这里（cdp_port / relay_port / wb_exe）
+# 之前 CDP_PORT 写死 9226，别人改了 config.json 的 cdp_port 反代会连不上，故改成读配置
+# ----------------------------------------------------------------------------
+def _cfgval(key, default=None):
+    if WM is not None:
+        try:
+            return (WM.cfg() or {}).get(key, default)
+        except Exception:
+            pass
+    return default
+
+
+try:
+    CDP_PORT = int(_cfgval("cdp_port", CDP_PORT) or CDP_PORT)
+except Exception:
+    pass
+try:
+    CDP_TIMEOUT_SEC = float(_cfgval("cdp_timeout_sec", 300) or 300)
+except Exception:
+    CDP_TIMEOUT_SEC = 300.0
+UPSTREAM_PATH = str(_cfgval("upstream_path", UPSTREAM_PATH) or UPSTREAM_PATH)
+
+DEFAULT_MODEL = (WM.active_model() if WM is not None else "kimi-k3.1-pro")
 KNOWN_MODELS = _known_models()
+
+
+class CdpTimeout(RuntimeError):
+    """CDP 上游超时：WorkBuddy 渲染进程无响应，或没带 --remote-debugging-port 启动。"""
 
 # ----------------------------------------------------------------------------
 # 运行状态记录（供 auto_switch.py 守护进程只读消费，零额外 token 成本）
@@ -141,14 +168,15 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def _find_page_ws():
     url = "http://%s:%d/json" % (CDP_HOST, CDP_PORT)
-    with _OPENER.open(url, timeout=15) as r:
+    with _OPENER.open(url, timeout=5) as r:
         targets = json.loads(r.read().decode("utf-8", "replace"))
     pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
     if not pages:
-        raise RuntimeError("WorkBuddy 渲染页面没找到，确认 WorkBuddy 已启动且开着 --remote-debugging-port=9226")
-    # 优先选 WorkBuddy 主界面
+        raise RuntimeError("WorkBuddy 渲染页面没找到，确认 WorkBuddy 已启动且开着 --remote-debugging-port=%d" % CDP_PORT)
+    # 优先选 WorkBuddy 主界面（页面 URL 里通常带 workbuddy / app.asar）
     pages.sort(key=lambda t: (1 if "index.html" in (t.get("url") or "") else 0,
-                              1 if "Nworkbuddy" in (t.get("url") or "") or "app.asar" in (t.get("url") or "") else 0),
+                              1 if "workbuddy" in (t.get("url") or "").lower()
+                              or "app.asar" in (t.get("url") or "") else 0),
               reverse=True)
     return pages[0]["webSocketDebuggerUrl"]
 
@@ -156,11 +184,13 @@ def _find_page_ws():
 class CdpSession:
     def __init__(self):
         self.ws = websocket.create_connection(
-            _find_page_ws(), timeout=1800, max_size=128 * 1024 * 1024,
+            _find_page_ws(), timeout=CDP_TIMEOUT_SEC, max_size=128 * 1024 * 1024,
             skip_utf8_validation=True, suppress_origin=True)
         self.mid = 0
 
-    def eval(self, expression, timeout_ms=1800000):
+    def eval(self, expression, timeout_ms=None):
+        if timeout_ms is None:
+            timeout_ms = int(CDP_TIMEOUT_SEC * 1000)
         self.mid += 1
         mid = self.mid
         payload = {
@@ -174,8 +204,16 @@ class CdpSession:
             },
         }
         self.ws.send(json.dumps(payload, ensure_ascii=False))
+        deadline = time.time() + CDP_TIMEOUT_SEC
         while True:
-            raw = self.ws.recv()
+            left = deadline - time.time()
+            if left <= 0:
+                raise CdpTimeout("CDP %d 秒无响应，WorkBuddy 渲染进程可能已卡死" % int(CDP_TIMEOUT_SEC))
+            try:
+                self.ws.settimeout(min(left, 5.0))
+                raw = self.ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
             if not raw:
                 raise RuntimeError("CDP 连接被关闭")
             msg = json.loads(raw)
@@ -307,6 +345,9 @@ def call_upstream(body):
         try:
             conn = _get_conn()
             res = conn.eval(js)
+        except CdpTimeout:
+            # 超时重试只会让客户端再干等一轮，直接向上抛，由 HTTP 层回 504 说清原因
+            raise
         except Exception as e:
             msg = str(e)
             # 页面 JS 真实报错不重试；其余（连接断开/页面刷新/WorkBuddy 重启）一律重连后重试一次
@@ -381,9 +422,16 @@ def run_relay(oai_req, hdr_model=None):
     t0 = time.time()
     try:
         res = call_upstream(body)
+    except CdpTimeout as e:
+        detail = ("CDP 上游超时：%s。排查：① WorkBuddy 是否带 --remote-debugging-port=%d 启动"
+                  "（浏览器打开 http://127.0.0.1:%d/json/version 应返回 JSON）；"
+                  "② WorkBuddy 界面是否卡死，重启一次；"
+                  "③ 确认工作时没有人在 WB 里开着长任务占住渲染进程。" % (str(e)[:200], CDP_PORT, CDP_PORT))
+        _record_upstream_error(model, {"kind": "cdp_timeout", "detail": detail[:400]})
+        return {"ok": False, "model": model, "type": "cdp_timeout", "detail": detail}
     except Exception as e:
         _record_upstream_error(model, {"kind": "relay", "detail": "relay upstream failed: %s" % str(e)[:400]})
-        return {"ok": False, "model": model,
+        return {"ok": False, "model": model, "type": "api_error",
                 "detail": "relay upstream failed: %s" % str(e)[:500]}
 
     # 正文空但思考有内容 + 被 length 截断 → 放大预算重试一次
@@ -401,7 +449,7 @@ def run_relay(oai_req, hdr_model=None):
 
     if not res.get("ok"):
         _record_upstream_error(model, res)
-        return {"ok": False, "model": model,
+        return {"ok": False, "model": model, "type": "upstream_error",
                 "detail": "workbuddy upstream error: %s %s" % (res.get("detail"), res.get("body") or "")}
 
     _LAST_OK[0] = time.time()
@@ -459,9 +507,23 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 _get_conn()
                 up = "ok"
+                hint = ""
             except Exception as e:
                 up = "error: " + str(e)[:200]
-            return self._json(200, {"status": "ok", "app": "workmom", "cdp": up,
+                hint = ("CDP %d 连不上：确认 WorkBuddy 已启动并带 --remote-debugging-port=%d 参数，"
+                        "浏览器访问 http://127.0.0.1:%d/json/version 应能返回 JSON。"
+                        % (CDP_PORT, CDP_PORT, CDP_PORT))
+            _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+            _wb = str(_cfgval("wb_exe", "") or "")
+            return self._json(200, {"status": "ok", "app": "workmom", "cdp": up, "hint": hint,
+                                    "cdp_port": CDP_PORT,
+                                    "cdp_timeout_sec": CDP_TIMEOUT_SEC,
+                                    "config_file": _cfg_path,
+                                    "config_exists": os.path.exists(_cfg_path),
+                                    "wb_exe": _wb,
+                                    "wb_exe_exists": bool(_wb) and os.path.exists(_wb),
+                                    "python": sys.version.split()[0],
+                                    "uptime_sec": int(time.time() - _START_AT[0]),
                                     "default_model": _active_model(),
                                     "model": _active_model(),
                                     "models": _known_models(),
@@ -527,7 +589,8 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(req.get("stream"))
         r = run_relay(req, self.headers.get("X-WM-Model"))
         if not r["ok"]:
-            return self._json(502, {"error": {"message": r["detail"], "type": "api_error"}})
+            code = 504 if r.get("type") == "cdp_timeout" else 502
+            return self._json(code, {"error": {"message": r["detail"], "type": r.get("type") or "api_error"}})
 
         res = r["res"]
         content = res.get("content") or ""
@@ -588,8 +651,10 @@ class Handler(BaseHTTPRequestHandler):
         oai_req, meta = RP.anthropic_to_openai(req)
         r = run_relay(oai_req, self.headers.get("X-WM-Model"))
         if not r["ok"]:
-            return self._json(502, {"type": "error",
-                                    "error": {"type": "api_error", "message": r["detail"]}})
+            code = 504 if r.get("type") == "cdp_timeout" else 502
+            return self._json(code, {"type": "error",
+                                     "error": {"type": r.get("type") or "api_error",
+                                               "message": r["detail"]}})
         res, model = r["res"], r["model"]
 
         if not meta["stream"]:
@@ -610,7 +675,10 @@ class Handler(BaseHTTPRequestHandler):
         oai_req, meta = RP.responses_to_openai(req)
         r = run_relay(oai_req, self.headers.get("X-WM-Model"))
         if not r["ok"]:
-            return self._json(502, {"error": {"message": r["detail"], "type": "api_error", "code": "upstream_error"}})
+            code = 504 if r.get("type") == "cdp_timeout" else 502
+            return self._json(code, {"error": {"message": r["detail"],
+                                               "type": r.get("type") or "api_error",
+                                               "code": "upstream_error"}})
         res, model = r["res"], r["model"]
 
         if not meta["stream"]:

@@ -138,7 +138,7 @@ def load_cfg():
     p = os.path.join(BASE, "config.json")
     if os.path.exists(p):
         try:
-            with open(p, encoding="utf-8") as f:
+            with open(p, encoding="utf-8-sig") as f:
                 cfg.update(json.load(f) or {})
         except Exception as e:
             log("config.json 读取失败，用默认配置: %s" % e)
@@ -317,7 +317,7 @@ def wd_api_token(cfg):
     ]
     for p in cands:
         try:
-            with open(p, encoding="utf-8") as f:
+            with open(p, encoding="utf-8-sig") as f:
                 tok = (f.read() or "").strip()
             if len(tok) == 64:
                 return tok

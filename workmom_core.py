@@ -86,7 +86,9 @@ def cfg():
     c = dict(DEF)
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, encoding="utf-8") as f:
+            # utf-8-sig：Windows 记事本 / PowerShell 写出来的 config.json 常带 BOM，
+            # 用 utf-8 硬读会解析失败并静默退回默认值，导致改了配置却不生效
+            with open(CONFIG_FILE, encoding="utf-8-sig") as f:
                 c.update(json.load(f) or {})
         except Exception:
             pass

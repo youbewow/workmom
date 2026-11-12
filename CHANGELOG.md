@@ -1,4 +1,34 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 9786fb266a4a0ba7e741af4014ef6d27_05237d1fde5211f19280525400393706
+    ReservedCode1: XO/fHg9sVibmzyZBp3WfGJSVnjDSPxZGBLCfZUmnrf7mlldWqShPaTuOA/uH74KxMbpq+zrqhauBWRAr+cUP2V8KSMzPaGAZVctvQt/OIR72QS3Tjfs4EQd3UE1VxNOWoxpdkBYXkTKaezdbi+CHL3eIh382hXPGELyBZm7mNLDak7xNHGWCpUW6S2I=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 9786fb266a4a0ba7e741af4014ef6d27_05237d1fde5211f19280525400393706
+    ReservedCode2: XO/fHg9sVibmzyZBp3WfGJSVnjDSPxZGBLCfZUmnrf7mlldWqShPaTuOA/uH74KxMbpq+zrqhauBWRAr+cUP2V8KSMzPaGAZVctvQt/OIR72QS3Tjfs4EQd3UE1VxNOWoxpdkBYXkTKaezdbi+CHL3eIh382hXPGELyBZm7mNLDak7xNHGWCpUW6S2I=
+---
+
 # 更新记录
+
+## 0.3.1 — 2026-11-12
+
+**可移植性修复：让 clone 下来的人真能跑**
+
+- `server.py`：`CDP_PORT` 不再写死 9226，改为读 `config.json` 的 `cdp_port`（此前改 config 无效，9226 被占用的机器直接不可用）；
+  同理 `upstream_path` 也走 config
+- `server.py`：新增 CDP 调用总超时（`cdp_timeout_sec`，默认 300 秒）。以前 `Runtime.evaluate` 默认 30 分钟超时，
+  WorkBuddy 渲染进程卡死时客户端会静默挂半小时；现在超时抛 `CdpTimeout`，**不重试**，直接返回 `504` + `type:"cdp_timeout"` + 分步排查提示
+- `workmom_core.py` / `workmom_guard.py`：读 `config.json` 与 `pythonw.txt` 改 `utf-8-sig`。
+  Windows 记事本 / PowerShell 存盘默认带 BOM，旧的 `utf-8` 硬读会解析失败并被 `except` 静默吞掉，
+  表现为「改了 config 却不生效」，排查极难
+- `GET /health` 升级为自检口：新增 `hint`、`cdp_port`、`cdp_timeout_sec`、`config_file/exists`、
+  `wb_exe/exists`、`python`、`uptime_sec`；`cdp` 连不上时直接给排查顺序
+- `_find_page_ws` 超时 15 秒 → 5 秒；报错信息用实际 `cdp_port`；页面挑选不区分大小写（`Nworkbuddy`/`workbuddy` 都能命中）
+- `config.example.json` 增加 `cdp_timeout_sec`
+- README 新增「一·五、别人 clone 下来能直接用吗」（五个前提 + 不含个人数据说明）、
+  「四·五、模型选在哪、怎么接进 agent」（面板双击选模型 / 客户端填 base_url / `X-WM-Model` 单次覆盖三张表），
+  排障表补 504 `cdp_timeout`、`/health` 各字段两个条目
 
 ## 0.3.0 — 2026-11-12
 
@@ -37,3 +67,4 @@
 - `server.py` 经 CDP 复用 WorkBuddy 登录态，在 `127.0.0.1:18793` 提供 OpenAI 兼容接口
 - `workmom_guard.py` 盯 `/relay_state`，遇 429/6004 自动按额度队列换号
 - `dashboard.py` 总控面板、`start_all.vbs`/`stop_all.bat` 一键启停、`boot_silent.vbs` 开机静默自启
+*（内容由AI生成，仅供参考）*

@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 9786fb266a4a0ba7e741af4014ef6d27_05f18ee3de5211f19280525400393706
+    ReservedCode1: 9aLrQ1VvkZSNMCxO1MxPipjTGFGO02t4lyf+xmud6IXIEPYSNAR1rn8DQ+lRuvOg7JfmQEcVtG/0ihquBgUGl2Gey7Gec7Hm71R21JTW4uH9CGhQeff5BNBfPPVQXvHBkjRNPlEjmj+7zHmf33+2ryteIU8wV3GRc7tC5m9fFGDAH8bBRIGym2zb5kg=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 9786fb266a4a0ba7e741af4014ef6d27_05f18ee3de5211f19280525400393706
+    ReservedCode2: 9aLrQ1VvkZSNMCxO1MxPipjTGFGO02t4lyf+xmud6IXIEPYSNAR1rn8DQ+lRuvOg7JfmQEcVtG/0ihquBgUGl2Gey7Gec7Hm71R21JTW4uH9CGhQeff5BNBfPPVQXvHBkjRNPlEjmj+7zHmf33+2ryteIU8wV3GRc7tC5m9fFGDAH8bBRIGym2zb5kg=
+---
+
 # 架构与实现要点
 
 > 这份文档回答一个事：workmom 凭什么能用、每个部件在干什么、坏的时候该往哪看。
@@ -140,3 +151,4 @@ wb_profile() 校验当前 uid          确认真的换过来了
 7. `X-WM-Model` 头覆盖验证
 8. 面板切模型后再打一次，确认模型跟着变
 9. 面板切账号后 `/health` 的 `uid` 变了、模型没变
+*（内容由AI生成，仅供参考）*

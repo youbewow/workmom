@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 9786fb266a4a0ba7e741af4014ef6d27_043bcd2ede5211f19232525400248c00
+    ReservedCode1: 0nqUgkO5QeWgrqQOJ0SDzcevco2bggDKexc3SG8esRhJOhNxi2Oz5KWxyQE2t5W3o2TJ4jMnypUyuwZZ/h41If1DKu9iwzOlJrDPi5FH7ZEZStUv6WsclZyCjrcguhlAI+wYacPHh645yunvk6sMuS3mJXabAlS01Y5Dg2YJ5WIpaxoEadCoEmMgYJ0=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 9786fb266a4a0ba7e741af4014ef6d27_043bcd2ede5211f19232525400248c00
+    ReservedCode2: 0nqUgkO5QeWgrqQOJ0SDzcevco2bggDKexc3SG8esRhJOhNxi2Oz5KWxyQE2t5W3o2TJ4jMnypUyuwZZ/h41If1DKu9iwzOlJrDPi5FH7ZEZStUv6WsclZyCjrcguhlAI+wYacPHh645yunvk6sMuS3mJXabAlS01Y5Dg2YJ5WIpaxoEadCoEmMgYJ0=
+---
+
 # workmom —— WorkBuddy 账号 / 模型 总控（自研，不依赖 WorkDaddy）
 
 一个本地小工具集，把 WorkBuddy 桌面端的「账号」和「模型」拆成两个互不干扰的维度来管：
@@ -59,6 +70,29 @@ python dashboard.py                      # 总控面板（另开窗口）
 含账号凭证或本机路径，已在 `.gitignore` 里排除，**不要提交、不要截图外发**。
 轮换队列里的账号 uid 也放在 `data/guard_queue.json`（不入库），格式见该文件注释。
 
+## 一·五、别人 clone 下来能直接用吗
+
+**代码层面能**，但有四个属于「机器自己」的前提，缺一个就跑不通：
+
+| 前提 | 缺了会怎样 |
+| --- | --- |
+| 本机装了 WorkBuddy，并登录了**你自己的**账号 | 拿不到登录态和密钥，请求全部失败 |
+| WorkBuddy 带 `--remote-debugging-port=9226` 启动 | `/health` 里 `cdp` = error 且带 `hint`，请求直接报错 |
+| Python 3.9+ 且 `pip install -r requirements.txt` | `ModuleNotFoundError: websocket` / `cryptography` |
+| `copy config.example.json config.json`，把 `wb_exe` 改成本机实际路径 | 面板的切号 / 重启 WB 找不到程序（反代走 CDP，不依赖这个路径） |
+| 端口 9226、18793 没被占用 | 被占就改 `cdp_port` / `relay_port`，**两处要一致** |
+
+**仓库里没有任何个人数据**：`config.json`、`data/`、`logs/`、`backups/`、`guard_state.json`、
+`rate_limit_ledger.json`、`pythonw.txt` 全在 `.gitignore`，`git clone` 下来是干净的，不会带出别人的账号 uid 或本机路径。
+
+**这版专门修掉的两个「下了用不了」**：
+
+- `CDP_PORT` 以前写死 9226，`config.json` 里改 `cdp_port` 不生效（9226 被占用的人直接废）→ 现在真的读 config；
+- `config.json` 带 BOM（Windows 记事本 / PowerShell 存盘默认带 BOM）时配置会被静默吞掉，改了不生效 → 现在按 `utf-8-sig` 读。
+
+**做不到的事**：WorkBuddy 官方接口或密钥机制一旦变化，上游调用就会挂。这不在本仓库能控制的范围，
+届时更新 `workmom_core.py` 的探测 / 解密逻辑。
+
 ## 二、文件说明
 
 | 文件 | 作用 |
@@ -102,6 +136,27 @@ python dashboard.py                      # 总控面板（另开窗口）
 - `一键领全部积分` = 给所有号领当日积分（凭证过期会先自动 refresh）
 - `重启 WB(兜底)` = 只有无感切号失败、CDP 不可用时才用，会重启 WorkBuddy
 
+## 四·五、模型选在哪、怎么接进 agent
+
+一条链路三个点，各管一段，别搞混：
+
+| # | 在哪做 | 干什么 | 落到哪 |
+| --- | --- | --- | --- |
+| ① 选模型 | `dashboard.py` 面板 → **双击「模型使用情况」表里的那一行** | 决定反代所有请求默认用哪个模型 | `data/current_model.json` |
+| ② 接 agent | agent 客户端里填 `base_url` = `http://127.0.0.1:18793` | 让 agent 把请求发到反代而不是官方 API | 该 agent 自己的配置文件 |
+| ③ 单次覆盖 | 请求头 `X-WM-Model: glm-5.3` | 这一次请求换个模型，不动面板 | 仅本次请求 |
+
+各类 agent 的落点：
+
+| agent / 客户端 | 配在哪 | 关键字段 |
+| --- | --- | --- |
+| Claude Code | `%USERPROFILE%\.claude\settings.json` | `env.ANTHROPIC_BASE_URL` = `http://127.0.0.1:18793`；`env.ANTHROPIC_AUTH_TOKEN` = 任意非空串（如 `wb-workmom`）；`model` = 面板选的那个 |
+| Codex CLI | `~/.codex/config.toml` | `base_url` = `http://127.0.0.1:18793/v1`，`wire_api = "responses"` |
+| Marvis / Cherry Studio / Cline 等 OpenAI 兼容客户端 | 客户端「自定义模型 / API 设置」 | Base URL `http://127.0.0.1:18793/v1`；API Key 随便填一个非空串；模型名填面板当前模型 |
+
+要点：**API Key 填任意非空串就行**——反代不校验 key，真正用的凭证是 WorkBuddy 桌面端已经登好的那套。
+完整片段见 `多协议接入说明.md`。
+
 ## 五、两条硬规则（设计核心）
 
 1. **选定模型后，换任何账号，模型都是当前这个。**
@@ -111,7 +166,8 @@ python dashboard.py                      # 总控面板（另开窗口）
 
 ## 六、反代接口
 
-- `GET /health` —— 存活 + 当前模型 + 当前 uid + 模型清单
+- `GET /health` —— 存活 + 当前模型 + 当前 uid + 模型清单；另带自检字段 `cdp` / `hint` / `cdp_port` /
+  `cdp_timeout_sec` / `config_exists` / `wb_exe_exists` / `python` / `uptime_sec`，装完先看这一个就够定位
 - `GET /relay_state` —— 运行状态（守护只读消费，零额外 token）
 - `GET /v1/models` —— OpenAI 格式模型列表
 - `POST /v1/chat/completions` —— OpenAI Chat 协议，`model` 字段留空则用当前模型
@@ -134,7 +190,9 @@ python dashboard.py                      # 总控面板（另开窗口）
 | 一直 6004 | 该账号该模型在滚动窗口里用完，看面板「限流倒计时」；换模型或等重置 |
 | 弹 `Windows Script Host` / `run_guard.vbs 第2行` / `缺少对象: 's'` / `800A01A8` | **换行符不是 CRLF**。VBScript 的注释行只认 `CR` 结束，纯 `LF` 的文件会让第 1 行注释把 `Set s = ...` 吞掉，于是 `s` 从未创建。修复：所有 `.vbs`/`.bat` 必须是 **CRLF + 纯 ASCII**（无中文注释、无 BOM）。批量转法：`$t = ($t -replace "`r`n","`n") -replace "`n","`r`n"` 后按单字节编码写回；改完用 `cscript //nologo xxx.vbs` 干跑验证退出码 0 |
 | 双击 `run_*.vbs` 没任何反应 | `logs/launch_error.log`：一定是找不到 `pythonw.exe`。把它写进同目录 `pythonw.txt`，或建 `.venv` |
-| 反代在、`/health` 也 ok，但请求全 60s 超时 | 大概率是 WorkBuddy 渲染进程主线程卡死（CDP 浏览器级能连、页面级 `Runtime.evaluate` 超时）。重启 WorkBuddy，`Page.reload` 救不回来 |
+| 反代在、`/health` 也 ok，但请求卡很久后回 **504 `cdp_timeout`** | WorkBuddy 渲染进程主线程卡死（CDP 浏览器级能连、页面级 `Runtime.evaluate` 超时）。错误文案里已列出排查顺序；重启 WorkBuddy，`Page.reload` 救不回来。超时时长用 `config.json` 的 `cdp_timeout_sec` 调（默认 300 秒） |
+| `/health` 里 `cdp: error` | 看同响应里的 `hint`：WorkBuddy 没带 `--remote-debugging-port` 启动，或 `config.json` 的 `cdp_port` 跟实际不一致 |
+| `/health` 里 `config_exists: false` / `wb_exe_exists: false` | 还没 `copy config.example.json config.json`，或 `wb_exe` 路径写错（面板切号要用它） |
 
 旧目录 `D:\K3.1pro反代`（原 K3.1-pro 反代 + 老面板 + 老守护）已于 2026-11-12 删除，当前只以 `D:\workmom` 为准；需要回退可用 `backups\` 下的 `server.py.bak-*`。
 
@@ -145,3 +203,4 @@ MIT License，见 `LICENSE`。
 - 本项目只是把**你自己机器上、你自己已经登录的**桌面客户端复用到本地回环口上，不破解、不分发任何凭证；
 - 它不提供、也不绕过任何账号或额度限制，所有额度仍由 WorkBuddy 官方账号体系决定；
 - 请自行确认你的使用方式符合 WorkBuddy 服务条款；由此产生的任何后果由使用者自负。
+*（内容由AI生成，仅供参考）*
