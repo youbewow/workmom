@@ -67,4 +67,3 @@ AIGC:
 - `server.py` 经 CDP 复用 WorkBuddy 登录态，在 `127.0.0.1:18793` 提供 OpenAI 兼容接口
 - `workmom_guard.py` 盯 `/relay_state`，遇 429/6004 自动按额度队列换号
 - `dashboard.py` 总控面板、`start_all.vbs`/`stop_all.bat` 一键启停、`boot_silent.vbs` 开机静默自启
-*（内容由AI生成，仅供参考）*
