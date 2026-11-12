@@ -7,5 +7,21 @@
   "relay_port": 18793,
   "wd_dir": "",
   "default_model": "kimi-k3.1-pro",
-  "checkin_concurrency": 3
+  "checkin_concurrency": 3,
+  "_comment_transport": "auto=直连优先失败回落渲染进程 / direct=只直连 / cdp=只走渲染进程(旧行为)",
+  "transport": "auto",
+  "max_concurrency": 4,
+  "direct_timeout_sec": 600,
+  "stream_idle_timeout_sec": 180,
+  "_comment_auto_heal": "off=关闭看门狗 / report=只上报 / restart=连续2次探活失败且直连无成功时自动重启WorkBuddy",
+  "auto_heal": "report",
+  "heal_interval_sec": 60,
+  "fallback_models": [
+    "kimi-k3.1-pro",
+    "kimi-k3-2",
+    "kimi-k3-1",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
+    "glm-5.3"
+  ]
 }

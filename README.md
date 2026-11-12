@@ -144,7 +144,12 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 | `rate_limit_ledger.json` | 限流账本：哪个号哪个模型、限流到什么时候 |
 | `guard_state.json` | 守护状态：上次切号、退避、历史 |
 | `logs/` | `workmom.log` / `workmom_guard.log` / `relay.out.log` / `relay.err.log` |
-| `relay_protocols.py` | 三协议转换层：Anthropic Messages / OpenAI Responses ↔ OpenAI Chat（含流式事件序列） |
+| `relay_protocols.py` | 三协议转换层：Anthropic Messages / OpenAI Responses ↔ OpenAI Chat（非流式 / 兼容用） |
+| `wm_transport.py` | **直连传输层**：直接拿 token 走 httpx 打上游，真流式逐行产出、无全局锁、结构化识别 429/6004、模型级熔断 |
+| `relay_stream.py` | **增量流式翻译器**：上游来一个 chunk 就吐一个，不再「攒全文再切片」 |
+| `panel.html` | （可选）自定义 Web 面板；没有这个文件时用 `server.py` 内置的默认面板 |
+| `tests/test_relay.py` | 回归测试：13 项覆盖真流式 / 并发 / 限额透传 / 面板 / 账本 / 看门狗 |
+| `run_relay.bat` | 守护发现反代掉了时用它拉起（`run_relay.vbs` 的批处理壳） |
 | `config.example.json` | 配置模板，复制成 `config.json` 再改 |
 | `pythonw.txt` | （可选，不入库）一行写死 pythonw.exe 路径，供 `.vbs` 启动器使用 |
 | `setup.bat` | **一键初始化入口，双击这个即可**。纯 ASCII + CRLF，只负责找 Python 并调 `setup.py` |
@@ -203,10 +208,33 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 2. **选定账号后，改任何模型，账号都是当前这个。**
    切模型只写 `current_model.json`，不碰登录文件、不刷新页面、不动 WB。
 
+## 五·五、配置项速查（`config.json`）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `wb_exe` | 自动探测 | WorkBuddy.exe 路径 |
+| `cdp_port` | `9226` | WorkBuddy 的远程调试端口（必须带 `--remote-debugging-port` 启动） |
+| `relay_port` | `18793` | 反代监听端口（命令行参数优先） |
+| `default_model` | `kimi-k3.1-pro` | 兜底默认模型；真正生效的是 `data/current_model.json` |
+| `cdp_timeout_sec` | `300` | 单次 CDP 往返超时 |
+| `transport` | `auto` | `auto` 直连优先失败回落 / `direct` 只直连 / `cdp` 只走渲染进程 |
+| `max_concurrency` | `4` | 直连通道最大并发（超出排队） |
+| `direct_timeout_sec` | `600` | 直连单次请求总超时 |
+| `stream_idle_timeout_sec` | `180` | 流式「多久没新数据算断」 |
+| `fallback_models` | pro → k3-2 → k3-1 → deepseek → glm | 上游 6004 / 429 时的自动降级顺序 |
+| `auto_heal` | `report` | 看门狗：`off` 关闭 / `report` 只上报 / `restart` 自动重启 WorkBuddy |
+| `heal_interval_sec` | `60` | 看门狗探活间隔 |
+
+改完不需要重装，重启反代生效：`stop_all.bat` 后双击桌面 `workmom`。
+
 ## 六、反代接口
 
 - `GET /health` —— 存活 + 当前模型 + 当前 uid + 模型清单；另带自检字段 `cdp` / `hint` / `cdp_port` /
-  `cdp_timeout_sec` / `config_exists` / `wb_exe_exists` / `python` / `uptime_sec`，装完先看这一个就够定位
+  `cdp_timeout_sec` / `config_exists` / `wb_exe_exists` / `python` / `uptime_sec`，装完先看这一个就够定位。
+  0.5.0 起再加 `transport` / `transport_ready` / `max_concurrency` / `direct` / `cdp_health` /
+  `cooldowns` / `usage` / `auto_heal` / `fallback_models`
+- `GET /` `GET /panel` —— **Web 面板**（浏览器直接看，不用开 Tkinter）：通道健康、CDP 探活、限流冷却倒计时、
+  用量账本、近期错误表，10 秒自动刷新
 - `GET /relay_state` —— 运行状态（守护只读消费，零额外 token）
 - `GET /v1/models` —— OpenAI 格式模型列表
 - `POST /v1/chat/completions` —— OpenAI Chat 协议，`model` 字段留空则用当前模型
@@ -217,12 +245,42 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 三套协议共用同一上游调用，转换逻辑在 `relay_protocols.py`；接入配置见 `多协议接入说明.md`。
 请求头 `X-WM-Model: <模型名>` 可临时覆盖面板模型。
 
-上游 6004（频率限制）会原样透出 `code/msg`，不再吞成空 502。
+### 流式与并发（0.5.0 起）
+
+| 项 | 0.4.x 之前 | 0.5.0 |
+| --- | --- | --- |
+| 流式 | 上游全量生成完，Python 侧再按 512 字符切片发 → 首字延迟 = 全量耗时 | 直连上游 SSE，**来一个 chunk 吐一个**，首字节 ≈ 2 秒 |
+| 并发 | `threading.Lock()` 包住整个 CDP 往返，多客户端排队，等效并发 1 | 直连无锁，`max_concurrency` 限流（默认 4） |
+| 传输 | 只能过 WorkBuddy 渲染进程（`window.wb.http.post`），WB 卡死即全挂 | `transport=auto` 优先直连，直连不可用才回落 CDP |
+
+`config.json` 里 `transport` 可选 `auto`（默认）/ `direct`（只直连，失败直报错）/ `cdp`（只走渲染进程，旧行为）。
+
+### 错误怎么透传（这条是 0.5.0 的重点）
+
+以前上游 429 频率限制会被兜成 **502 + 空 body**，客户端只能显示「原因暂不明确」，看不出是额度问题。
+现在按协议返回 **HTTP 429**，body 是结构化错误，带重置时间：
+
+```json
+{
+  "error": {
+    "type": "rate_limit_error",
+    "code": "6004",
+    "message": "您的使用量已超出频率限制，将在 2026-11-13 05:56:45 UTC+8 重置，您也可以切换其他模型继续使用。",
+    "reset_at": "2026-11-13 05:56:45"
+  }
+}
+```
+
+响应头另带 `Retry-After`（秒）与 `X-WM-Quota-Exceeded: 1`。
+同时反代按 `fallback_models` 顺序**自动降级**到下一个没用满的模型继续出字，只有全都被限才真的报 429。
 
 ## 七、排障
 
 | 现象 | 先看哪 |
 | --- | --- |
+| 客户端只报「原因暂不明确」/「未知错误」，看不出是不是额度 | 0.4.x 的老问题（上游 429 被兜成空 502）。0.5.0 起已改成结构化 429，可直接看到 `code 6004` + 重置时间。若还看到空 body：`curl -s -i -X POST http://127.0.0.1:18793/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"kimi-k3.1-pro\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"` 亲眼确认状态码与 body；仍是 502 说明跑的还是旧进程，`stop_all.bat` 后重起 |
+| 明明上游限流了，反代却像「没发生」 | 这是降级在起作用：反代按 `fallback_models` 自动换到下一个没用满的模型，客户端拿到的是 200。想确认当下真实状态看 `GET /`（Web 面板「限流冷却」区块）或 `/health` 里的 `cooldowns` / `pro_6004` 计数 |
+| 只有部分请求能出字、偶发卡死，重启 WorkBuddy 就好 | 渲染进程主线程卡死的典型症状。0.5.0 起有看门狗：`/health` 的 `cdp_health` 里看 `ok` / `fail_streak` / `last_err`；`auto_heal=report` 只上报，想让它自动重启 WorkBuddy 就改 `auto_heal=restart`（连续 2 次探活失败且直连 5 分钟没成功才动手） |
 | 双击 `setup.bat` 窗口一闪就没 | 多半是没装 Python 或没勾 Add to PATH。开个 cmd 把 bat 拖进去运行，就能看到报错 |
 | `setup.bat` 说没找到 WorkBuddy | 先装 WorkBuddy；脚本会问你要路径，也可以自己在 `config.json` 填 `wb_exe`（留空则运行时自动探测） |
 | `setup.bat` 说 CDP 不通、自检失败 | 按它打印的手动命令带 `--remote-debugging-port=9226` 重启 WorkBuddy，再跑一次 `setup.bat` |

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 workmom —— WorkBuddy -> 多协议本地反代（模型由 workmom 面板选定，与账号完全解耦）
@@ -28,9 +28,25 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import re
+
 import websocket
 
 import relay_protocols as RP
+
+# 直连传输层（P0-1 真流式 / P0-2 并发 / P0-3 卡死免疫 / P0-0 错误透传）
+# 导入失败不致命：自动退回 CDP 通道（老行为），保证任何环境都能起来
+try:
+    import wm_transport as WT
+except Exception as _e:                # pragma: no cover
+    WT = None
+    _WT_IMPORT_ERR = str(_e)
+# 增量流式翻译器（把上游每个 chunk 实时翻成三种客户端协议）
+try:
+    import relay_stream as RS
+except Exception as _e:                # pragma: no cover
+    RS = None
+    _RS_IMPORT_ERR = str(_e)
 
 # pythonw.exe 下 sys.stdout 为 None，print 会崩，兜底重定向到日志
 if sys.stdout is None or sys.stderr is None:
@@ -99,6 +115,55 @@ try:
 except Exception:
     CDP_TIMEOUT_SEC = 300.0
 UPSTREAM_PATH = str(_cfgval("upstream_path", UPSTREAM_PATH) or UPSTREAM_PATH)
+
+# ---------------------------------------------------------------------------
+# P0 运行时配置（全部可在 config.json 覆盖，缺省即可用）
+# ---------------------------------------------------------------------------
+# transport: direct=永远走直连; cdp=永远走渲染进程; auto=直连优先、失败自动回落 CDP
+TRANSPORT = str(_cfgval("transport", "auto") or "auto").lower()
+try:
+    MAX_CONCURRENCY = max(1, int(_cfgval("max_concurrency", 16) or 16))
+except Exception:
+    MAX_CONCURRENCY = 16
+try:
+    DIRECT_TIMEOUT = float(_cfgval("direct_timeout_sec", 300) or 300)
+except Exception:
+    DIRECT_TIMEOUT = 300.0
+# 限流自动降级链：只在「429/6004 且可降级」时按顺序换模型重试，永不改变客户端协议
+FALLBACK_MODELS = _cfgval("fallback_models", []) or []
+if isinstance(FALLBACK_MODELS, str):
+    FALLBACK_MODELS = [x.strip() for x in FALLBACK_MODELS.split(",") if x.strip()]
+# auto_heal: report=只上报+记日志; restart=连续探活失败自动重启 WorkBuddy; off=关
+AUTO_HEAL = str(_cfgval("auto_heal", "report") or "report").lower()
+try:
+    HEAL_INTERVAL = max(15, int(_cfgval("heal_interval_sec", 60) or 60))
+except Exception:
+    HEAL_INTERVAL = 60
+try:
+    QUOTA_WARN_PERCENT = float(_cfgval("quota_warn_percent", 80) or 80)
+except Exception:
+    QUOTA_WARN_PERCENT = 80.0
+# 流式空闲超时：两行 SSE 之间允许的最长静默（秒），防客户端死等
+try:
+    STREAM_IDLE_TIMEOUT = float(_cfgval("stream_idle_timeout_sec", 180) or 180)
+except Exception:
+    STREAM_IDLE_TIMEOUT = 180.0
+
+# 并发闸门：ThreadingHTTPServer 本身不限制线程数，上游有账号级频率限制，
+# 无节制并发只会把 6004 提前触发，所以用信号量做「排队而不是被拒」
+_CONC_SEM = threading.BoundedSemaphore(MAX_CONCURRENCY)
+
+# 直连通道健康度（供 /relay_state 与自愈判断）
+_DIRECT_LOCK = threading.Lock()
+_DIRECT_STAT = {
+    "ok": 0, "fail": 0,
+    "last_ok_at": 0, "last_fail_at": 0,
+    "last_err": "", "last_ttfb_ms": 0,
+    "active": 0,             # 当前在途直连流
+}
+# CDP 通道探活状态（自愈依据）
+_CDP_HEALTH = {"ok": None, "fail_streak": 0, "last_check": 0, "last_err": "",
+               "healed_at": 0, "heal_count": 0}
 
 DEFAULT_MODEL = (WM.active_model() if WM is not None else "kimi-k3.1-pro")
 KNOWN_MODELS = _known_models()
@@ -411,11 +476,11 @@ def build_upstream_body(oai_req, model):
 
 
 def run_relay(oai_req, hdr_model=None):
-    """执行一次上游调用 + 空正文放大重试。
+    """执行一次【CDP 通道】上游调用 + 空正文放大重试。
 
     返回 dict：
       成功 {"ok": True, "res": <聚合结果>, "model": <实际模型>, "elapsed": 秒}
-      失败 {"ok": False, "detail": "错误描述", "model": <模型>}
+      失败 {"ok": False, "err": RelayError, "model": <模型>, "detail": 旧字段兼容}
     """
     model = resolve_model(hdr_model, oai_req.get("model"))
     body = build_upstream_body(oai_req, model)
@@ -428,11 +493,16 @@ def run_relay(oai_req, hdr_model=None):
                   "② WorkBuddy 界面是否卡死，重启一次；"
                   "③ 确认工作时没有人在 WB 里开着长任务占住渲染进程。" % (str(e)[:200], CDP_PORT, CDP_PORT))
         _record_upstream_error(model, {"kind": "cdp_timeout", "detail": detail[:400]})
-        return {"ok": False, "model": model, "type": "cdp_timeout", "detail": detail}
+        err = RelayError(http=504, code="cdp_timeout", type="api_error",
+                         message=detail, fallbackable=False)
+        return {"ok": False, "model": model, "type": "cdp_timeout",
+                "detail": detail, "err": err}
     except Exception as e:
         _record_upstream_error(model, {"kind": "relay", "detail": "relay upstream failed: %s" % str(e)[:400]})
+        err = RelayError(http=502, code="relay_failed", type="api_error",
+                         message="relay upstream failed: %s" % str(e)[:500], fallbackable=True)
         return {"ok": False, "model": model, "type": "api_error",
-                "detail": "relay upstream failed: %s" % str(e)[:500]}
+                "detail": err.message, "err": err}
 
     # 正文空但思考有内容 + 被 length 截断 → 放大预算重试一次
     if (res.get("ok") and not (res.get("content") or "").strip()
@@ -449,8 +519,10 @@ def run_relay(oai_req, hdr_model=None):
 
     if not res.get("ok"):
         _record_upstream_error(model, res)
+        err = _cdp_res_to_error(res, model)
         return {"ok": False, "model": model, "type": "upstream_error",
-                "detail": "workbuddy upstream error: %s %s" % (res.get("detail"), res.get("body") or "")}
+                "detail": "workbuddy upstream error: %s %s" % (res.get("detail"), res.get("body") or ""),
+                "err": err}
 
     _LAST_OK[0] = time.time()
     return {"ok": True, "res": res, "model": res.get("model") or model,
@@ -458,8 +530,355 @@ def run_relay(oai_req, hdr_model=None):
 
 
 # ----------------------------------------------------------------------------
+# P0-0 结构化错误：把上游限流原样翻译给客户端
+# ----------------------------------------------------------------------------
+class RelayError(Exception):
+    """反代对外统一错误类型（与 wm_transport.UpstreamError 字段一致）。
+
+    统一成一种类型的好处：CDP 通道、直连通道、协议翻译层的错误
+    走同一条出口，HTTP 层只需看 err.http / err.payload()。
+    """
+
+    def __init__(self, http=502, status=None, code="", type="api_error",
+                 message="upstream error", reset_at="", retry_after=0,
+                 raw="", fallbackable=False):
+        super().__init__(message)
+        self.http = int(http or 502)
+        self.status = status
+        self.code = str(code or "")
+        self.type = type
+        self.message = message
+        self.reset_at = reset_at or ""
+        self.retry_after = int(retry_after or 0)
+        self.raw = (raw or "")[:1000]
+        self.fallbackable = bool(fallbackable)
+
+    def payload(self):
+        err = {"message": self.message, "type": self.type}
+        if self.code:
+            err["code"] = self.code
+        if self.status:
+            err["upstream_status"] = self.status
+        if self.reset_at:
+            err["reset_at"] = self.reset_at
+        if self.retry_after:
+            err["retry_after"] = self.retry_after
+        return {"error": err}
+
+    @property
+    def is_quota(self):
+        return self.http == 429 or self.code == "6004" or self.type == "rate_limit_error"
+
+    def __str__(self):
+        return "RelayError(%s/%s) %s" % (self.http, self.code or "-", self.message[:160])
+
+
+_RE_RESET = re.compile(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\s*UTC[+-]\d+)?)")
+
+
+def _cdp_res_to_error(res, model):
+    """把 CDP 通道的失败结果翻译成结构化错误（P0-0 的老通道修复）。
+
+    旧实现直接把上游 429/code 6004 包成 502 一行字符串，客户端当网关故障，
+    用户只看到「原因暂不明确」。这里把 status/code/重置时间抠出来还原成 429。
+    """
+    body = str(res.get("body") or "")
+    detail = str(res.get("detail") or "")
+    status = res.get("status")
+    try:
+        status = int(status) if status else None
+    except Exception:
+        status = None
+    blob = (detail + " " + body).strip()
+
+    code = ""
+    m = re.search(r'"code"\s*:\s*"?(-?\d+)"?', blob)
+    if m:
+        code = m.group(1)
+    reset = ""
+    m2 = _RE_RESET.search(blob)
+    if m2:
+        reset = m2.group(1)
+
+    # 上游业务消息（body 有时是 JSON 字符串套 JSON）
+    upmsg = ""
+    for cand in (body, detail):
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, str):
+            try:
+                obj = json.loads(obj)
+            except Exception:
+                continue
+        if isinstance(obj, dict):
+            disp = obj.get("displayMsg")
+            if isinstance(disp, dict) and (disp.get("zh") or disp.get("zh-hans")):
+                upmsg = disp.get("zh") or disp.get("zh-hans")
+            upmsg = upmsg or obj.get("msg") or obj.get("message") or ""
+            if upmsg:
+                break
+
+    if status == 429 or code == "6004":
+        msg = upmsg or "上游限流：当前账号该模型的使用量已超出频率限制"
+        if reset and reset not in msg:
+            msg = "%s（将于 %s 重置）" % (msg, reset)
+        return RelayError(http=429, status=status or 429, code=code or "6004",
+                          type="rate_limit_error", message=msg, reset_at=reset,
+                          retry_after=60, raw=blob, fallbackable=True)
+    if status in (401, 403):
+        return RelayError(http=401, status=status, code=code or "invalid_token",
+                          type="authentication_error",
+                          message=upmsg or "账号凭证失效，请重新登录 WorkBuddy",
+                          raw=blob, fallbackable=False)
+    if status in (400, 422):
+        return RelayError(http=400, status=status, code=code or "invalid_request",
+                          type="invalid_request_error",
+                          message=upmsg or "上游拒绝了该请求：参数不合法", raw=blob,
+                          fallbackable=False)
+    if status == 404:
+        return RelayError(http=404, status=status, code=code or "not_found",
+                          type="invalid_request_error",
+                          message=upmsg or "上游没有该资源（模型名可能写错）", raw=blob,
+                          fallbackable=True)
+    return RelayError(http=502, status=status, code=code or "upstream_error",
+                      type="api_error",
+                      message=upmsg or ("workbuddy upstream error: %s" % (blob[:300] or "未知")),
+                      raw=blob, fallbackable=True)
+
+
+def _note_error(model, err, channel):
+    """统一记录一次失败（日志 + 熔断 + 状态面板）。"""
+    now = int(time.time())
+    with _DIRECT_LOCK:
+        _DIRECT_STAT["fail"] += 1
+        _DIRECT_STAT["last_fail_at"] = now
+        _DIRECT_STAT["last_err"] = ("[%s] %s" % (channel, str(err)[:200]))
+    _record_upstream_error(model, {
+        "kind": channel, "status": err.status, "code6004": err.is_quota,
+        "detail": str(err)[:300], "body": err.raw[:600],
+    })
+    if err.is_quota and WT is not None:
+        # 熔断：默认按上游给的重置时间，但至少 60s，最多 30 分钟，避免一直空打上游
+        secs = 120
+        if err.reset_at:
+            try:
+                ts = time.mktime(time.strptime(err.reset_at[:19].replace("T", " "),
+                                               "%Y-%m-%d %H:%M:%S"))
+                secs = max(60, min(1800, int(ts - time.time())))
+            except Exception:
+                secs = 600
+        WT.cooldown_set(model, secs, reset_at=err.reset_at, msg=err.message, code=err.code)
+
+
+# ----------------------------------------------------------------------------
+# P0-1/P0-2 直连通道：真流式 + 无锁并发
+# ----------------------------------------------------------------------------
+def _model_chain(model):
+    """返回降级链：先主模型，再 config 里配的备用模型（去重、只认已知模型）。"""
+    chain = [model]
+    if not FALLBACK_MODELS:
+        return chain
+    km = _known_models()
+    for m in FALLBACK_MODELS:
+        name = _pick_name(m)
+        if name and name in km and name not in chain:
+            chain.append(name)
+    return chain
+
+
+def open_direct(oai_req, hdr_model=None):
+    """建一条直连上游流。
+
+    返回 (stream, model)。stream 已 open，调用方负责 close。
+    失败抛 RelayError（已做降级链与熔断判断）。
+    """
+    if WT is None:
+        raise RelayError(http=502, code="no_transport", type="api_error",
+                         message="直连传输层不可用：%s" % globals().get("_WT_IMPORT_ERR", "import failed"))
+    base_model = resolve_model(hdr_model, oai_req.get("model"))
+    chain = _model_chain(base_model)
+    errors = []
+
+    for model in chain:
+        # 熔断中且不是唯一选项 → 直接跳过（省一次无意义的上游往返）
+        cd = WT.cooldown_get(model)
+        if cd and len(chain) > 1:
+            errors.append(RelayError(http=429, type="rate_limit_error", code="6004",
+                                     message="%s 处于限流冷却（剩 %ds）" % (model, cd["left"]),
+                                     reset_at=cd.get("reset_at") or "", fallbackable=True))
+            continue
+        if cd and len(chain) == 1:
+            # 唯一模型且正在熔断：立刻把真实原因告诉客户端，不再打上游
+            raise RelayError(http=429, type="rate_limit_error", code="6004",
+                             message=cd.get("msg") or "上游限流中",
+                             reset_at=cd.get("reset_at") or "",
+                             retry_after=cd.get("left") or 60, fallbackable=True)
+
+        body = build_upstream_body(oai_req, model)
+        st = WT.DirectStream(body, model=model, stream=True, timeout=DIRECT_TIMEOUT)
+        try:
+            st.open()
+        except WT.UpstreamError as e:
+            err = RelayError(http=e.http, status=e.status, code=e.code, type=e.type,
+                             message=e.message, reset_at=e.reset_at,
+                             retry_after=e.retry_after, raw=e.raw,
+                             fallbackable=e.fallbackable)
+            errors.append(err)
+            _note_error(model, err, "direct-open")
+            # 429 / 404（模型不存在）→ 换备用模型；其余（400/401）换模型也没用
+            if err.http in (429, 404) and model != chain[-1]:
+                continue
+            raise err
+        except Exception as e:
+            err = RelayError(http=502, code="direct_error", type="api_error",
+                             message="直连上游异常：%s" % str(e)[:200], fallbackable=True)
+            errors.append(err)
+            _note_error(model, err, "direct-open")
+            raise err
+
+        with _DIRECT_LOCK:
+            _DIRECT_STAT["last_ttfb_ms"] = int((st.meta or {}).get("ttfb_ms") or 0)
+            _DIRECT_STAT["active"] += 1
+        return st, model
+
+    # 全部候选都失败：优先把最"真实"的那个错误抛出去（429 优先于 502）
+    quota = [e for e in errors if e.is_quota]
+    raise (quota[0] if quota else (errors[-1] if errors else
+          RelayError(http=502, message="没有可用的上游模型")))
+
+
+
+# ----------------------------------------------------------------------------
 # HTTP 层
 # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# 通用小工具：chunk 解析 / 非流式响应体 / 用量账本（P1-2 持久化）
+# ----------------------------------------------------------------------------
+def _err_from_chunk_error(obj):
+    """上游在流中间塞了一条 error 事件 → 转成统一错误对象。"""
+    e = obj.get("error")
+    if not isinstance(e, dict):
+        e = {"message": str(e)}
+    code = str(e.get("code") or "")
+    msg = e.get("message") or e.get("msg") or "上游在流中报错"
+    if code == "6004" or code == "429":
+        return RelayError(http=429, status=429, code=code or "6004",
+                          type="rate_limit_error", message=msg, fallbackable=True)
+    return RelayError(http=502, status=None, code=code or "upstream_error",
+                      type="api_error", message=msg, fallbackable=True)
+
+
+def _iter_chunks(st):
+    """把直连流的 SSE 原始行解成一个个 JSON chunk（遇 [DONE] 结束）。"""
+    for raw in st.lines():
+        line = raw.strip()
+        if not line or line.startswith(b":"):
+            continue
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        if payload == b"[DONE]":
+            return
+        try:
+            obj = json.loads(payload.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error"):
+            raise _err_from_chunk_error(obj)
+        yield obj
+
+
+def _openai_completion_body(res, model, client_model=None):
+    """聚合结果 -> OpenAI 非流式 chat.completion 响应体。"""
+    content = res.get("content") or ""
+    tool_calls = res.get("tool_calls") or []
+    finish = res.get("finish") or ("tool_calls" if tool_calls else "stop")
+    msg = {"role": "assistant", "content": content}
+    if res.get("reasoning"):
+        msg["reasoning_content"] = res["reasoning"]
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+        if not content:
+            msg["content"] = None
+    return {
+        "id": res.get("id") or "wb-chat",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model or client_model or "",
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+        "usage": res.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0,
+                                      "total_tokens": 0},
+    }
+
+
+_USAGE_LOCK = threading.Lock()
+_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "usage.jsonl")
+_USAGE = {"req": 0, "prompt_tokens": 0, "completion_tokens": 0,
+          "by_model": {}, "by_kind": {}, "by_day": {}, "since": int(time.time())}
+
+
+def _usage_add(rec):
+    pin = int(rec.get("in") or 0)
+    pout = int(rec.get("out") or 0)
+    model = rec.get("model") or "-"
+    kind = rec.get("kind") or "chat"
+    day = rec.get("day") or time.strftime("%Y-%m-%d", time.localtime(rec.get("at") or time.time()))
+    _USAGE["req"] += 1
+    _USAGE["prompt_tokens"] += pin
+    _USAGE["completion_tokens"] += pout
+    m = _USAGE["by_model"].setdefault(model, {"req": 0, "in": 0, "out": 0})
+    m["req"] += 1
+    m["in"] += pin
+    m["out"] += pout
+    _USAGE["by_kind"][kind] = _USAGE["by_kind"].get(kind, 0) + 1
+    d = _USAGE["by_day"].setdefault(day, {"req": 0, "in": 0, "out": 0})
+    d["req"] += 1
+    d["in"] += pin
+    d["out"] += pout
+
+
+def _load_usage():
+    """启动时把历史账本读回来，重启不归零。"""
+    try:
+        with open(_USAGE_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    _usage_add(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
+def _note_usage(model, usage, kind="chat"):
+    """记一笔用量：内存汇总 + 追加 logs/usage.jsonl（崩溃/重启后可恢复）。"""
+    usage = usage or {}
+    rec = {"at": int(time.time()), "day": time.strftime("%Y-%m-%d"),
+           "kind": kind, "model": model or "",
+           "in": int(usage.get("prompt_tokens") or 0),
+           "out": int(usage.get("completion_tokens") or 0)}
+    with _USAGE_LOCK:
+        _usage_add(rec)
+    try:
+        os.makedirs(os.path.dirname(_USAGE_FILE), exist_ok=True)
+        with open(_USAGE_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+_load_usage()
+
 
 def _sse(obj):
     return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
@@ -476,14 +895,40 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("[relay] " + (fmt % args) + "\n")
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, extra_headers=None):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(data)
+
+    def _err_json(self, err, protocol="openai"):
+        """把 RelayError 按客户端协议格式返回（P0-0：限额就是 429，不再是 502 空壳）。"""
+        hdrs = {}
+        if err.retry_after:
+            hdrs["Retry-After"] = str(err.retry_after)
+        if err.is_quota:
+            hdrs["X-WM-Quota-Exceeded"] = "1"
+            if err.reset_at:
+                hdrs["X-WM-Quota-Reset"] = err.reset_at
+        if protocol == "anthropic":
+            body = {"type": "error",
+                    "error": {"type": err.type or "api_error", "message": err.message}}
+            if err.code:
+                body["error"]["code"] = err.code
+        else:
+            body = err.payload()
+        try:
+            sys.stderr.write("[relay] 返回错误 %s -> HTTP %d %s\n"
+                             % ((err.code or err.type), err.http, err.message[:160]))
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return self._json(err.http, body, hdrs)
 
     def _begin_stream(self):
         self.send_response(200)
@@ -503,16 +948,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
-        if path in ("/health", ""):
+        # 根路径 = 真·Web 面板（以前返回 /health 的 JSON，README 却说"浏览器打开就是面板"，对不上）
+        if path in ("", "/panel", "/index.html", "/dashboard"):
             try:
-                _get_conn()
-                up = "ok"
-                hint = ""
-            except Exception as e:
-                up = "error: " + str(e)[:200]
-                hint = ("CDP %d 连不上：确认 WorkBuddy 已启动并带 --remote-debugging-port=%d 参数，"
-                        "浏览器访问 http://127.0.0.1:%d/json/version 应能返回 JSON。"
-                        % (CDP_PORT, CDP_PORT, CDP_PORT))
+                html = _panel_html().encode("utf-8")
+            except Exception as ex:
+                return self._json(500, {"error": {"type": "panel_error", "message": str(ex)}})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(html)
+            except Exception:
+                pass
+            return
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/health":
+            # 不再用长连接探活（渲染进程卡死时会把 /health 一起拖死），
+            # 优先用看门狗缓存，缓存过期才现场探一次（自带 4s 上限）。
+            with _DIRECT_LOCK:
+                cached = dict(_CDP_HEALTH)
+            if cached["ok"] is None or (int(time.time()) - int(cached["last_check"] or 0)) > 120:
+                ok, why = _probe_cdp()
+                with _DIRECT_LOCK:
+                    _CDP_HEALTH["ok"] = ok
+                    _CDP_HEALTH["last_check"] = int(time.time())
+                    _CDP_HEALTH["last_err"] = why
+            else:
+                ok, why = bool(cached["ok"]), cached["last_err"]
+            up = "ok" if ok else ("error: " + (why or "unknown"))
+            hint = "" if ok else ("CDP %d 不可用：确认 WorkBuddy 已启动并带 --remote-debugging-port=%d 参数，"
+                                  "浏览器访问 http://127.0.0.1:%d/json/version 应能返回 JSON。"
+                                  "若直连通道正常（transport=direct/auto），反代照常工作。"
+                                  % (CDP_PORT, CDP_PORT, CDP_PORT))
             _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
             _wb = str(_cfgval("wb_exe", "") or "")
             return self._json(200, {"status": "ok", "app": "workmom", "cdp": up, "hint": hint,
@@ -534,7 +1008,8 @@ class Handler(BaseHTTPRequestHandler):
                                                   "/v1/messages/count_tokens", "/v1/responses", "/v1/models"],
                                     "stats": dict(REQ_STATS),
                                     "uid": _current_uid(),
-                                    "upstream": "http://%s:%d%s" % (CDP_HOST, CDP_PORT, UPSTREAM_PATH)})
+                                    "upstream": "http://%s:%d%s" % (CDP_HOST, CDP_PORT, UPSTREAM_PATH),
+                                    **_health_extra()})
         if path in ("/relay_state", "/state"):
             with _ERR_LOCK:
                 errs = list(LAST_ERRORS)
@@ -554,6 +1029,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pro_6004_count": len(pro_6004),
                 "stats": dict(REQ_STATS),
                 "errors": errs[-10:],
+                **_health_extra(),
             })
         if path in ("/v1/models", "/models"):
             now = int(time.time())
@@ -585,14 +1061,144 @@ class Handler(BaseHTTPRequestHandler):
             return self.responses_api(req)
         return self._json(404, {"error": {"message": "not found: " + path, "type": "invalid_request_error"}})
 
+    # ------------------------------------------------------------------
+    # P0 统一上游出入口
+    # ------------------------------------------------------------------
+    def _drop_direct(self, st):
+        try:
+            st.close()
+        except Exception:
+            pass
+        with _DIRECT_LOCK:
+            _DIRECT_STAT["active"] = max(0, _DIRECT_STAT["active"] - 1)
+
+    def _stream_error(self, protocol, err):
+        """流已开始后（HTTP 200 已发出）才发现的错误：只能用协议内错误事件表达。"""
+        try:
+            if protocol == "anthropic":
+                self.wfile.write(_sse_named("error", {
+                    "type": "error",
+                    "error": {"type": err.type or "api_error", "message": err.message}}))
+            elif protocol == "responses":
+                self.wfile.write(_sse_named("response.failed", {
+                    "type": "response.failed",
+                    "response": {"status": "failed",
+                                 "error": {"code": err.code or "upstream_error",
+                                           "message": err.message}}}))
+            else:
+                self.wfile.write(_sse({"error": {"message": err.message,
+                                                 "type": err.type or "api_error",
+                                                 "code": err.code or "upstream_error"}}))
+                self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    def _pump(self, st, protocol, client_model):
+        """真流式：上游来一个 chunk 就翻一个给客户端，不缓存全文（P0-1）。"""
+        tr = RS.make(protocol, client_model)
+        try:
+            for name, obj in tr.start_events():
+                self.wfile.write(RS.sse_bytes(name, obj))
+            self.wfile.flush()
+            for chunk in _iter_chunks(st):
+                out = tr.feed(chunk)
+                if out:
+                    for name, obj in out:
+                        self.wfile.write(RS.sse_bytes(name, obj))
+                    self.wfile.flush()
+            for name, obj in tr.finish_events():
+                self.wfile.write(RS.sse_bytes(name, obj))
+            if protocol == "openai":
+                self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端主动断开（Claude Code 按 Esc 是常态），不算错误
+            pass
+        except RelayError as e:
+            _note_error(client_model, e, "direct-stream")
+            self._stream_error(protocol, e)
+        except WT.UpstreamError as e:
+            err = RelayError(http=e.http, status=e.status, code=e.code, type=e.type,
+                             message=e.message, reset_at=e.reset_at,
+                             retry_after=e.retry_after, raw=e.raw,
+                             fallbackable=e.fallbackable)
+            _note_error(client_model, err, "direct-stream")
+            self._stream_error(protocol, err)
+        except Exception as e:
+            self._stream_error(protocol, RelayError(
+                http=502, code="stream_error", type="api_error",
+                message="流式传输异常：%s" % str(e)[:200]))
+        return tr.result()
+
+    def _collect_direct(self, st, client_model):
+        """非流式：把真流一遍读全，再用同一个聚合器出结果。"""
+        tr = RS.make("openai", client_model)
+        for chunk in _iter_chunks(st):
+            tr.feed(chunk)
+        tr.finish_events()
+        return tr.result()
+
+    def _try_direct(self, oai_req, hdr_model, protocol, want_stream, client_model):
+        """尝试直连路径。
+
+        返回 (done, payload)：
+          done=True  → 已完整响应客户端，payload 为 None
+          done=False → 直连不可用，payload 为 RelayError（调用方可选择回落 CDP）
+        """
+        if TRANSPORT not in ("auto", "direct") or WT is None or RS is None:
+            return False, None
+        try:
+            st, model = open_direct(oai_req, hdr_model)
+        except RelayError as e:
+            # 线路级故障（502/504）在 auto 模式下回落 CDP；语义级故障（429/400/401）如实回
+            if TRANSPORT == "auto" and e.fallbackable and e.http in (502, 504):
+                return False, None
+            self._err_json(e, protocol)
+            return True, e
+
+        try:
+            if want_stream:
+                self._begin_stream()
+                res = self._pump(st, protocol, client_model)
+            else:
+                res = self._collect_direct(st, client_model)
+        finally:
+            self._drop_direct(st)
+
+        with _DIRECT_LOCK:
+            _DIRECT_STAT["ok"] += 1
+            _DIRECT_STAT["last_ok_at"] = int(time.time())
+        _LAST_OK[0] = time.time()
+        _note_usage(model, res.get("usage"), protocol)
+
+        if want_stream:
+            return True, None
+
+        # 非流式响应体按协议构造
+        if protocol == "anthropic":
+            self._json(200, RP.openai_to_anthropic(res, model))
+        elif protocol == "responses":
+            self._json(200, RP.openai_to_responses(res, model))
+        else:
+            self._json(200, _openai_completion_body(res, model, client_model))
+        return True, None
+
     # -- OpenAI Chat Completions（原生） -------------------------------------
     def chat(self, req):
         _bump("chat")
         want_stream = bool(req.get("stream"))
+        client_model = req.get("model") or _active_model()
+
+        done, _e = self._try_direct(req, self.headers.get("X-WM-Model"),
+                                    "openai", want_stream, client_model)
+        if done:
+            return
+
+        # CDP 回落通道（老逻辑保留：直连被墙/页面内代理可用时兜底）
         r = run_relay(req, self.headers.get("X-WM-Model"))
         if not r["ok"]:
-            code = 504 if r.get("type") == "cdp_timeout" else 502
-            return self._json(code, {"error": {"message": r["detail"], "type": r.get("type") or "api_error"}})
+            return self._err_json(r["err"], "openai")
 
         res = r["res"]
         content = res.get("content") or ""
@@ -601,23 +1207,12 @@ class Handler(BaseHTTPRequestHandler):
         usage = res.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         cid = res.get("id") or "wb-chat"
         cmodel = r["model"]
+        _note_usage(cmodel, usage, "chat")
 
         if not want_stream:
-            msg = {"role": "assistant", "content": content}
-            if res.get("reasoning"):
-                msg["reasoning_content"] = res["reasoning"]
-            if tool_calls:
-                msg["tool_calls"] = tool_calls
-                if not content:
-                    msg["content"] = None
-            return self._json(200, {
-                "id": cid, "object": "chat.completion", "created": int(time.time()),
-                "model": cmodel,
-                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": usage,
-            })
+            self._json(200, _openai_completion_body(res, cmodel, client_model))
+            return
 
-        # 流式：整体拿到后再按 chunk 吐出（上游是一次性返回全文）
         self._begin_stream()
         try:
             self.wfile.write(_sse({"id": cid, "object": "chat.completion.chunk",
@@ -651,15 +1246,20 @@ class Handler(BaseHTTPRequestHandler):
     def anthropic_messages(self, req):
         _bump("anthropic")
         oai_req, meta = RP.anthropic_to_openai(req)
+        want_stream = bool(meta["stream"])
+
+        done, _e = self._try_direct(oai_req, self.headers.get("X-WM-Model"),
+                                    "anthropic", want_stream, req.get("model") or _active_model())
+        if done:
+            return
+
         r = run_relay(oai_req, self.headers.get("X-WM-Model"))
         if not r["ok"]:
-            code = 504 if r.get("type") == "cdp_timeout" else 502
-            return self._json(code, {"type": "error",
-                                     "error": {"type": r.get("type") or "api_error",
-                                               "message": r["detail"]}})
+            return self._err_json(r["err"], "anthropic")
         res, model = r["res"], r["model"]
+        _note_usage(model, res.get("usage"), "anthropic")
 
-        if not meta["stream"]:
+        if not want_stream:
             return self._json(200, RP.openai_to_anthropic(res, model))
 
         self._begin_stream()
@@ -675,15 +1275,20 @@ class Handler(BaseHTTPRequestHandler):
     def responses_api(self, req):
         _bump("responses")
         oai_req, meta = RP.responses_to_openai(req)
+        want_stream = bool(meta["stream"])
+
+        done, _e = self._try_direct(oai_req, self.headers.get("X-WM-Model"),
+                                    "responses", want_stream, req.get("model") or _active_model())
+        if done:
+            return
+
         r = run_relay(oai_req, self.headers.get("X-WM-Model"))
         if not r["ok"]:
-            code = 504 if r.get("type") == "cdp_timeout" else 502
-            return self._json(code, {"error": {"message": r["detail"],
-                                               "type": r.get("type") or "api_error",
-                                               "code": "upstream_error"}})
+            return self._err_json(r["err"], "openai")
         res, model = r["res"], r["model"]
+        _note_usage(model, res.get("usage"), "responses")
 
-        if not meta["stream"]:
+        if not want_stream:
             return self._json(200, RP.openai_to_responses(res, model))
 
         self._begin_stream()
@@ -694,6 +1299,241 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             sys.stderr.write("[relay] responses stream write failed: %s\n" % e)
         return
+
+
+def _probe_cdp():
+    """探活渲染进程：CDP 端口 -> 页面 -> 一次极轻的 evaluate。
+
+    分开判三层，是为了区分「WorkBuddy 没启动」「端口没开」「页面卡死」
+    三种完全不同的故障，重启动作只在第三层才该做。
+    """
+    try:
+        with _OPENER.open("http://%s:%d/json/version" % (CDP_HOST, CDP_PORT),
+                          timeout=5) as r:
+            r.read()
+    except Exception as e:
+        return False, "CDP 端口无响应（WorkBuddy 没启动或没带 --remote-debugging-port=%d）：%s" % (
+            CDP_PORT, str(e)[:120])
+    s = None
+    try:
+        s = CdpSession()
+        v = s.eval("1+1", timeout_ms=4000)
+        if v != 2:
+            return False, "CDP 回显异常：%r" % (v,)
+        return True, ""
+    except Exception as e:
+        return False, "页面无响应（渲染进程可能卡死）：%s" % str(e)[:160]
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _watchdog():
+    """P0-3 渲染进程卡死自愈。
+
+    WorkBuddy 渲染进程卡死后，所有 CDP 调用会一直挂着直到超时，
+    用户侧表现为「反代整个不动了」。这里做后台探活：
+      report  —— 只探活、记日志、把状态暴露到 /health，不擅自重启；
+      restart —— 连续 2 次探活失败且直连通道也不健康时，重启 WorkBuddy。
+    只有当「CDP 挂了且直连也不可用」时才重启——否则重启会打断用户正在用的 WB。
+    """
+    boot_slept = 0
+    while True:
+        time.sleep(min(HEAL_INTERVAL, 30) if boot_slept < 2 else HEAL_INTERVAL)
+        boot_slept += 1
+        if AUTO_HEAL == "off":
+            continue
+        ok, why = _probe_cdp()
+        now = int(time.time())
+        with _DIRECT_LOCK:
+            _CDP_HEALTH["last_check"] = now
+            _CDP_HEALTH["ok"] = ok
+            _CDP_HEALTH["last_err"] = why
+            _CDP_HEALTH["fail_streak"] = 0 if ok else _CDP_HEALTH["fail_streak"] + 1
+            streak = _CDP_HEALTH["fail_streak"]
+            direct_ok_recent = (now - int(_DIRECT_STAT.get("last_ok_at") or 0)) < 300
+        if ok:
+            continue
+        _boot_log("[watchdog] CDP 异常（连续 %d 次）：%s" % (streak, why))
+        if AUTO_HEAL != "restart":
+            if streak == 1 or streak % 10 == 0:
+                _boot_log("[watchdog] auto_heal=report，仅上报不重启；"
+                          "想让反代自动重启 WorkBuddy，把 config.json 的 auto_heal 改成 restart")
+            continue
+        if direct_ok_recent:
+            _boot_log("[watchdog] 直连通道 5 分钟内仍成功，跳过重启（避免打断正在用的 WorkBuddy）")
+            continue
+        if streak < 2:
+            continue
+        if WM is None or not hasattr(WM, "restart_wb"):
+            _boot_log("[watchdog] workmom_core 无 restart_wb，无法自愈")
+            continue
+        _boot_log("[watchdog] 连续 %d 次探活失败且直连不可用，重启 WorkBuddy 自愈" % streak)
+        try:
+            WM.restart_wb()
+            with _DIRECT_LOCK:
+                _CDP_HEALTH["healed_at"] = int(time.time())
+                _CDP_HEALTH["heal_count"] += 1
+                _CDP_HEALTH["fail_streak"] = 0
+            _boot_log("[watchdog] 已发出重启指令，等待 WorkBuddy 起来")
+        except Exception as e:
+            _boot_log("[watchdog] 重启失败：%s" % str(e)[:200])
+        time.sleep(45)
+
+
+def _health_extra():
+    """给 /health、/relay_state 共用的运行时状态块。"""
+    with _DIRECT_LOCK:
+        direct = dict(_DIRECT_STAT)
+        cdp = dict(_CDP_HEALTH)
+    with _USAGE_LOCK:
+        usage = {
+            "requests": _USAGE["req"],
+            "tokens_in": _USAGE["prompt_tokens"],
+            "tokens_out": _USAGE["completion_tokens"],
+            "by_model": {k: dict(v) for k, v in list(_USAGE["by_model"].items())[:20]},
+            "by_kind": dict(_USAGE["by_kind"]),
+            "by_day": {k: dict(v) for k, v in sorted(_USAGE["by_day"].items())[-7:]},
+            "file": _USAGE_FILE,
+        }
+    cooldowns = []
+    if WT is not None:
+        try:
+            cooldowns = WT.cooldown_snapshot()
+        except Exception:
+            cooldowns = []
+    return {
+        "transport": TRANSPORT,
+        "transport_ready": {"direct": WT is not None and RS is not None,
+                            "cdp": True},
+        "max_concurrency": MAX_CONCURRENCY,
+        "auto_heal": AUTO_HEAL,
+        "fallback_models": FALLBACK_MODELS,
+        "direct": direct,
+        "cdp_health": cdp,
+        "cooldowns": cooldowns,
+        "usage": usage,
+    }
+
+
+PANEL_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>workmom 反代面板</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#252a34;--txt:#e6e8ee;--dim:#8b93a6;--ok:#3ecf8e;--warn:#f2b544;--err:#ef5b5b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:22px 18px 60px}
+h1{font-size:19px;margin:0 0 2px}
+.sub{color:var(--dim);font-size:12px;margin-bottom:18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:10px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 13px}
+.card .k{color:var(--dim);font-size:11px;letter-spacing:.4px;text-transform:uppercase}
+.card .v{font-size:17px;margin-top:3px;word-break:break-all}
+.card .v.sm{font-size:13px}
+.sec{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:13px;margin-bottom:14px}
+.sec h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.5px}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:500}
+tr:last-child td{border-bottom:none}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.ok{background:var(--ok)}.warn{background:var(--warn)}.err{background:var(--err)}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:12px;margin:0;max-height:220px}
+.chip{display:inline-block;background:#20252f;border:1px solid var(--line);border-radius:20px;padding:1px 9px;font-size:12px;margin:2px 4px 2px 0}
+a{color:#6ab7ff;text-decoration:none}
+</style></head><body><div class="wrap">
+<h1>workmom 反代面板</h1>
+<div class="sub">本页每 3 秒自动刷新 · <a href="/health" target="_blank">/health</a> · <a href="/relay_state" target="_blank">/relay_state</a> · <a href="/v1/models" target="_blank">/v1/models</a></div>
+
+<div class="grid" id="grid"></div>
+
+<div class="sec"><h2>通道</h2><div id="chan"></div></div>
+<div class="sec"><h2>模型冷却（上游限流自动熔断）</h2><div id="cool"></div></div>
+<div class="sec"><h2>用量（持久化到 logs/usage.jsonl）</h2><div id="usage"></div></div>
+<div class="sec"><h2>最近上游错误</h2><div id="errs"></div></div>
+<div class="sec"><h2>原始 /health</h2><pre id="raw">加载中…</pre></div>
+
+<script>
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function ago(t){if(!t)return "-";var d=Math.floor(Date.now()/1000-t);if(d<0)d=0;if(d<60)return d+" 秒前";if(d<3600)return Math.floor(d/60)+" 分钟前";if(d<86400)return Math.floor(d/3600)+" 小时前";return Math.floor(d/86400)+" 天前";}
+function dot(cls){return '<span class="dot '+cls+'"></span>';}
+function card(k,v,sm){return '<div class="card"><div class="k">'+k+'</div><div class="v'+(sm?' sm':'')+'">'+v+'</div></div>';}
+
+function render(h,s){
+  var cd=h.cdp_health||{}, d=h.direct||{}, tr=h.transport||"?";
+  var ready=h.transport_ready||{};
+  var cdpOk = String(h.cdp||"").indexOf("ok")===0;
+  var directOk = d.last_ok_at && (Math.floor(Date.now()/1000)-d.last_ok_at < 1800);
+  var up=h.uptime_sec||0;
+  document.getElementById("grid").innerHTML =
+    card("反代", dot("ok")+esc(h.relay_port||"")+" 端口，在线 "+(up>3600?Math.floor(up/3600)+"h"+(Math.floor(up%3600/60))+"m":Math.floor(up/60)+" 分钟"),1)+
+    card("当前模型", esc(h.model||"-"),1)+
+    card("传输", dot(ready.direct?"ok":"warn")+esc(tr),1)+
+    card("直连通道", dot(directOk?"ok":"warn")+(directOk?"最近成功 "+ago(d.last_ok_at):"暂无成功记录"),1)+
+    card("渲染进程 CDP", dot(cdpOk?"ok":"err")+(cdpOk?"正常":"异常"),1)+
+    card("自愈模式", esc(h.auto_heal||"-"),1)+
+    card("并发上限", esc(h.max_concurrency||"-"),1)+
+    card("累计请求", esc((h.usage||{}).requests||0),1);
+
+  var directLine = '<tr><td>直连（真流式）</td><td>'+(ready.direct?'<span class="dot ok"></span>可用':'<span class="dot err"></span>不可用')+'</td><td>成功 '+esc(d.ok||0)+' · 失败 '+esc(d.fail||0)+' · 最近成功 '+ago(d.last_ok_at)+'</td></tr>';
+  var cdpLine = '<tr><td>CDP（WorkBuddy 渲染进程）</td><td>'+(cdpOk?'<span class="dot ok"></span>可用':'<span class="dot err"></span>'+esc(h.cdp||""))+'</td><td>连续失败 '+esc(cd.last_fail_streak||0)+' 次 · 检查于 '+ago(cd.last_check)+(cd.last_err?' · '+esc(cd.last_err):'')+'</td></tr>';
+  document.getElementById("chan").innerHTML = '<table><tbody>'+directLine+cdpLine+'</tbody></table>'+
+    '<div style="margin-top:8px">降级链：'+((h.fallback_models||[]).map(function(m){return '<span class="chip">'+esc(m)+'</span>';}).join("")||'-')+'</div>';
+
+  var co=h.cooldowns||[];
+  document.getElementById("cool").innerHTML = co.length
+    ? '<table><thead><tr><th>模型</th><th>剩余</th><th>原因</th><th>重置时间</th></tr></thead><tbody>'+co.map(function(c){
+        var left = c.until ? Math.max(0, c.until - Math.floor(Date.now()/1000)) : 0;
+        return '<tr><td>'+esc(c.model)+'</td><td>'+left+' 秒</td><td>'+esc(c.reason||c.kind||"-")+'</td><td class="mono">'+esc(c.reset_at||"-")+'</td></tr>';
+      }).join("")+'</tbody></table>'
+    : '<div style="color:var(--dim)">当前无模型处于冷却。</div>';
+
+  var u=h.usage||{}, bm=u.by_model||{}, keys=Object.keys(bm);
+  var head='<table><thead><tr><th>模型</th><th>请求</th><th>输入 tokens</th><th>输出 tokens</th></tr></thead><tbody>';
+  var rows = keys.length ? keys.map(function(k){var v=bm[k]||{};return '<tr><td class="mono">'+esc(k)+'</td><td>'+esc(v.req||0)+'</td><td>'+esc(v.prompt_tokens||0)+'</td><td>'+esc(v.completion_tokens||0)+'</td></tr>';}).join("")
+           : '<tr><td colspan="4" style="color:var(--dim)">暂无数据</td></tr>';
+  document.getElementById("usage").innerHTML='<div style="margin-bottom:8px">合计：'+esc(u.requests||0)+' 请求 · 输入 '+esc(u.tokens_in||0)+' · 输出 '+esc(u.tokens_out||0)+' · 账本 <span class="mono">'+esc(u.file||"")+'</span></div>'+head+rows+'</tbody></table>';
+
+  var er=(s&&s.errors)||[];
+  document.getElementById("errs").innerHTML = er.length
+    ? '<table><thead><tr><th>时间</th><th>模型</th><th>状态</th><th>信息</th></tr></thead><tbody>'+er.slice().reverse().map(function(e){
+        return '<tr><td class="mono">'+ago(e.at)+'</td><td class="mono">'+esc(e.model)+'</td><td>'+esc(e.status||"-")+(e.code6004?' <span class="chip">6004</span>':'')+'</td><td>'+esc(e.msg||e.error||"")+'</td></tr>';
+      }).join("")+'</tbody></table>'
+    : '<div style="color:var(--dim)">暂无错误。</div>';
+
+  document.getElementById("raw").textContent = JSON.stringify(h,null,2).slice(0,6000);
+}
+
+function tick(){
+  fetch("/health").then(function(r){return r.json();}).then(function(h){
+    return fetch("/relay_state").then(function(r){return r.json();}).then(function(s){render(h,s);})
+      .catch(function(){render(h,null);});
+  }).catch(function(e){
+    document.getElementById("raw").textContent = "无法连接反代：" + e;
+  });
+}
+tick(); setInterval(tick,3000);
+</script>
+</div></body></html>
+"""
+
+
+def _panel_html():
+    """面板页：优先用同目录 panel.html（方便用户自己改），否则用内置版本。"""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panel.html")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception:
+        pass
+    return PANEL_HTML
 
 
 def _boot_log(msg):
@@ -758,6 +1598,18 @@ def main():
               % (WM.APP_NAME, port, DEFAULT_MODEL))
     _boot_log("[relay] protocols: /v1/chat/completions | /v1/messages | /v1/responses")
     _boot_log("[relay] upstream via CDP %s:%d%s" % (CDP_HOST, CDP_PORT, UPSTREAM_PATH))
+    if WT is not None and RS is not None:
+        _boot_log("[relay] transport=%s（direct 直连真流式可用，max_concurrency=%d，"
+                  "降级链 %s）" % (TRANSPORT, MAX_CONCURRENCY, FALLBACK_MODELS or [DEFAULT_MODEL]))
+    else:
+        _boot_log("[relay] transport=%s（wm_transport/relay_stream 未就绪，仅 CDP 伪流式）"
+                  % TRANSPORT)
+    _boot_log("[relay] auto_heal=%s（report=只上报 / restart=卡死自动重启 WorkBuddy / off=关闭）"
+              % AUTO_HEAL)
+    if AUTO_HEAL != "off":
+        threading.Thread(target=_watchdog, name="wm-watchdog", daemon=True).start()
+    _boot_log("[relay] state: http://127.0.0.1:%d/health  http://127.0.0.1:%d/relay_state"
+              % (port, port))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
