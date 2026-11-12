@@ -17,9 +17,20 @@ workmom 把这两件事拆开，并且把 WorkBuddy 已经登录好的渲染进�
 - Claude Code、Codex CLI、各类 OpenAI 兼容客户端只要把 base_url 指过来，就能借 WorkBuddy 的额度干活；
 - 账号、模型各自独立切换，互不影响；额度爆了自动换号，客户端全程无感。
 
-## 一、装起来（两步）
+## 一、装起来（三步）
 
-前面不需要看别的东西，就两步。
+前面不需要看别的东西，就三步。
+
+**第 0 步：把整个目录弄到本地**（二选一）
+
+| 方式 | 怎么做 | 适合谁 |
+| --- | --- | --- |
+| 下载 ZIP | 页面右上绿色 `Code` → `Download ZIP` → 解压到任意普通文件夹，比如 `D:\workmom` | 不装 git 的人 |
+| git clone | `git clone https://github.com/youbewow/workmom.git D:\workmom` | 想随时 `git pull` 更新的人 |
+
+两点要留意：
+- **要整个目录，不要只下单个文件。** `server.py` 离开 `workmom_core.py` 等同伴跑不起来。
+- **别放在 `C:\Program Files` 这类受保护目录。** 脚本要写 `config.json` 和 `logs\`，放这些地方会因为权限失败。桌面、D 盘、用户目录都可以。
 
 **第 1 步：双击 `setup.bat`**
 
@@ -46,7 +57,7 @@ workmom 把这两件事拆开，并且把 WorkBuddy 已经登录好的渲染进�
 
 要在 Claude Code / Codex CLI / Marvis 里用，把 base_url 指向 `http://127.0.0.1:18793`，详见「四·五」。
 
-**就这两步。** 下面是备查细节。
+**就这三步。** 下面是备查细节。
 
 ### 手工部署（不想用脚本，或脚本卡住时）
 
