@@ -46,10 +46,10 @@ workmom 把这两件事拆开，并且把 WorkBuddy 已经登录好的渲染进�
 验证：浏览器打开 `http://127.0.0.1:9226/json/version` 能返回 JSON 即通。想常驻就改快捷方式的目标，
 在 exe 路径后加 ` --remote-debugging-port=9226`，或用 `boot_silent.vbs` 接管启动。
 
-**部署四步**
+**部署四步**（下面 `D:\workmom` 只是示例，换成你 clone 下来的实际目录）
 
 ```powershell
-cd D:\workmom
+cd <你clone下来的目录>
 pip install -r requirements.txt
 copy config.example.json config.json     # 再改里面的 wb_exe 等本机路径
 python server.py 18793                   # 反代
@@ -123,7 +123,7 @@ python dashboard.py                      # 总控面板（另开窗口）
 | 全量启动（反代 + 守护 + 面板） | 桌面 `workmom 一键启动.lnk` → `start_all.vbs` |
 | 只开面板 | 桌面 `workmom 总控面板.lnk` → `run_panel.vbs` |
 | 开机自启（静默，只反代+守护，不弹面板） | 启动文件夹 `workmom 自启.lnk` → `boot_silent.vbs` |
-| 全停 | `stop_all.bat`（只杀 `D:\workmom` 下的 python 进程） |
+| 全停 | `stop_all.bat`（只杀**本目录**下的 python 进程，按 `%~dp0` 定位，不认盘符） |
 
 > 所有 `.vbs` 都是**纯 ASCII**写的。别往里面加中文注释——WScript 按 GBK 解析会把下一行吞掉，报「缺少对象: 's'」。
 
@@ -194,7 +194,7 @@ python dashboard.py                      # 总控面板（另开窗口）
 | `/health` 里 `cdp: error` | 看同响应里的 `hint`：WorkBuddy 没带 `--remote-debugging-port` 启动，或 `config.json` 的 `cdp_port` 跟实际不一致 |
 | `/health` 里 `config_exists: false` / `wb_exe_exists: false` | 还没 `copy config.example.json config.json`，或 `wb_exe` 路径写错（面板切号要用它） |
 
-旧目录 `D:\K3.1pro反代`（原 K3.1-pro 反代 + 老面板 + 老守护）已于 2026-11-12 删除，当前只以 `D:\workmom` 为准；需要回退可用 `backups\` 下的 `server.py.bak-*`。
+当前只以本仓库为准。想回退到改造前的版本，用你自己 `backups\` 下的 `server.py.bak-*`（该目录不入库）。
 
 ## 八、License 与免责
 

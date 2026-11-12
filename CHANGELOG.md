@@ -58,7 +58,7 @@ AIGC:
 - 模型状态独立持久化到 `data/current_model.json`：换账号不改模型、改模型不动账号
 - 新增 `.info` 信封加解密（AES-256-GCM + 自定义 AAD），密钥由 `ELECTRON_RUN_AS_NODE` 探针向官方代码取
 - 面板双击行分别触发「切模型 / 切账号」；守护改为跟随面板所选模型，不再硬编码
-- 旧目录 `D:\K3.1pro反代` 下线，回退靠 `backups\server.py.bak-*`
+- 旧版反代工作目录下线，回退靠本地 `backups\server.py.bak-*`
 
 ## 0.1.0 — 2026-11-11
 
