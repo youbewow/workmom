@@ -1,4 +1,4 @@
-' workmom - local relay on port 18793 (hidden background)
+' workmom - local relay (port from config.json relay_port, default 18793), hidden background
 Option Explicit
 
 Dim fso, base, py, cmd
@@ -14,7 +14,9 @@ Dim sh, q
 q = Chr(34)
 Set sh = CreateObject("WScript.Shell")
 sh.CurrentDirectory = base
-cmd = q & py & q & " " & q & base & "\server.py" & q & " 18793"
+' Do NOT pass a port here: server.py reads relay_port from config.json itself.
+' (It used to be hardcoded " 18793", so editing relay_port had no effect.)
+cmd = q & py & q & " " & q & base & "\server.py" & q
 sh.Run cmd, 0, False
 
 

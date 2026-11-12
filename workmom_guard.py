@@ -136,12 +136,22 @@ def _load_queue(cfg):
 def load_cfg():
     cfg = dict(DEF)
     p = os.path.join(BASE, "config.json")
+    raw = {}
     if os.path.exists(p):
         try:
             with open(p, encoding="utf-8-sig") as f:
-                cfg.update(json.load(f) or {})
+                raw = json.load(f) or {}
+            cfg.update(raw)
         except Exception as e:
             log("config.json 读取失败，用默认配置: %s" % e)
+    # 反代地址跟着 relay_port 走：config.json 里没显式写 relay_base 时，
+    # 用 relay_port 拼。之前 relay_base 写死 18793，别人改了端口守护模块会一直报反代不可达。
+    if "relay_base" not in raw:
+        try:
+            _p = int(raw.get("relay_port") or cfg.get("relay_port") or 18793)
+        except Exception:
+            _p = 18793
+        cfg["relay_base"] = "http://127.0.0.1:%d" % _p
     if not cfg.get("wb_exe"):
         # 没手填路径就复用核心模块的探测（注册表 → 常见目录 → 运行中进程）
         try:

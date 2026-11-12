@@ -709,8 +709,43 @@ def _boot_log(msg):
         pass
 
 
+def _port_taken(port, host="127.0.0.1", timeout=1.0):
+    """127.0.0.1:port 上是否已有进程在监听。
+
+    Windows 下 SO_REUSEADDR 允许两个进程同时绑同一端口且都不报错，
+    结果是两个反代同时 LISTENING、请求被先启动的那个吞掉，排障时极难查。
+    所以启动前先探一下，被占用就明确报错，不做静默双绑。
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 18793
+    # 端口优先级：命令行参数 > config.json 的 relay_port > 18793
+    # 之前只认 argv，run_relay.vbs 又写死 18793，导致 config.json 里改了 relay_port 不生效
+    if len(sys.argv) > 1:
+        port = int(sys.argv[1])
+    else:
+        try:
+            port = int(_cfgval("relay_port", 18793) or 18793)
+        except Exception:
+            port = 18793
+    if _port_taken(port):
+        _boot_log("!! 端口 %d 已有程序在监听，为避免两个反代抢同一端口，本次不启动。"
+                  % port)
+        _boot_log("   反代可能已在运行（先跑 stop_all.bat 再启动）；"
+                  "或改 config.json 的 relay_port 换一个空闲端口。")
+        raise SystemExit(2)
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except Exception as e:

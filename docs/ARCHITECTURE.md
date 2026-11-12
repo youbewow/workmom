@@ -135,7 +135,8 @@ wb_profile() 校验当前 uid          确认真的换过来了
 | 页面没开调试端口 | 什么都连不上 | WorkBuddy 启动必须带 `--remote-debugging-port=9226` |
 | **渲染进程主线程卡死** | 反代报 `relay upstream failed: Connection timed out`，`/health` 里 `cdp: ok` 但请求全挂；用 CDP 连页面后 `Runtime.enable` / `Runtime.evaluate` 一律超时无响应 | 页面 JS 卡死（死循环/超大渲染），CDP 命令排不到主线程。`Page.reload` 也救不回来，唯一解是重启 WorkBuddy。判断法：浏览器级 `Browser.getVersion` 秒回、页面级 `Runtime.evaluate` 超时 = 渲染器卡死，不是网络问题 |
 | 切号后还是老号 | 切了没效果 | 页面 URL 里的 `accountSnapshot` 没清 |
-| 端口复用 | 反代起不来 | 旧进程占着 18793，跑 `stop_all.bat` |
+| 端口复用 | 反代起不来，日志报 `端口 xxxx 已有程序在监听` | `server.py` 启动前会探测，被占就 `exit(2)` 不硬绑。先跑 `stop_all.bat`；若是别的软件占着，改 `config.json` 的 `relay_port` 换端口（**只改这一处**，`run_relay.vbs` / 守护 / 面板 / 快捷方式都跟着走） |
+| 改了 `relay_port` 不生效 | 配置写 18899，实际仍监听 18793 | 0.4.0 及更早版本的坑：`run_relay.vbs` 写死 `server.py 18793` 而 `server.py` 只认命令行参数。已在 0.4.1 修复，端口优先级为 命令行参数 → `config.json.relay_port` → 18793 |
 | 日志膨胀 | 磁盘慢慢被吃 | 守护日志超 2MB 自动留尾部 2000 行 |
 
 ## 十二、自测清单

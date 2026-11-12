@@ -520,8 +520,35 @@ def selftest(cfgdata):
 
     good, body = health()
     started = False
-    if good:
+
+    def is_ours(b):
+        """响应是不是 workmom 反代本身（而不是恰好占了同一端口的别的程序）。"""
+        try:
+            return (json.loads(b) or {}).get("app") == "workmom"
+        except Exception:
+            return "workmom" in (b or "")
+
+    def port_listening(timeout=1.0):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex(("127.0.0.1", port)) == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    if good and is_ours(body):
         ok("反代已在运行（127.0.0.1:%d）" % port)
+    elif good or port_listening():
+        # 端口有人应答，但不是 workmom 反代 —— 硬启动会撞端口，先让人换端口
+        fail("端口 %d 已被别的程序占用（监听中的不是 workmom 反代）" % port)
+        info("把 config.json 里的 relay_port 改成别的空闲端口（如 18794），再重跑 setup.bat")
+        info("该端口当前返回: " + str(body)[:120].replace("\n", " "))
+        return False
     else:
         vbs = os.path.join(HERE, "run_relay.vbs")
         if not os.path.isfile(vbs):
@@ -564,8 +591,13 @@ def selftest(cfgdata):
 
 
 # --------------------------------------------------------------------------- 步骤 7
-def finish():
+def finish(cfgdata=None):
     step("收尾")
+    # 结尾提示里的地址必须跟 config.json 的实际 relay_port 一致，不能写死 18793
+    try:
+        _rp = int((cfgdata or {}).get("relay_port") or 18793)
+    except Exception:
+        _rp = 18793
     if os.name == "nt" and not SKIP_SHORTCUT:
         vbs = os.path.join(HERE, "start_all.vbs")
         if not os.path.isfile(vbs):
@@ -612,8 +644,8 @@ def finish():
     print("")
     print(" 下一步：")
     print("   1) 双击桌面 workmom 图标，或双击 start_all.vbs 启动全部服务")
-    print("   2) 浏览器打开 http://127.0.0.1:18793  看监控面板")
-    print("   3) 客户端里配 Base URL: http://127.0.0.1:18793/v1")
+    print("   2) 浏览器打开 http://127.0.0.1:%d  看监控面板" % _rp)
+    print("   3) 客户端里配 Base URL: http://127.0.0.1:%d/v1" % _rp)
     print("      API Key 随便填，模型名填 kimi-k3.1-pro")
     print("")
     print(" 停止服务: 双击 stop_all.bat")
@@ -651,7 +683,7 @@ def main():
     cfgdata = write_config()
     check_cdp(cfgdata)
     selftest(cfgdata)
-    return finish()
+    return finish(cfgdata)
 
 
 if __name__ == "__main__":
