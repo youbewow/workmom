@@ -142,6 +142,13 @@ def load_cfg():
                 cfg.update(json.load(f) or {})
         except Exception as e:
             log("config.json 读取失败，用默认配置: %s" % e)
+    if not cfg.get("wb_exe"):
+        # 没手填路径就复用核心模块的探测（注册表 → 常见目录 → 运行中进程）
+        try:
+            import workmom_core as _wm
+            cfg["wb_exe"] = _wm._guess_wb_exe()
+        except Exception:
+            pass
     cfg["queue"] = _load_queue(cfg)
     return cfg
 

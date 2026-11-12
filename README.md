@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 9786fb266a4a0ba7e741af4014ef6d27_043bcd2ede5211f19232525400248c00
-    ReservedCode1: 0nqUgkO5QeWgrqQOJ0SDzcevco2bggDKexc3SG8esRhJOhNxi2Oz5KWxyQE2t5W3o2TJ4jMnypUyuwZZ/h41If1DKu9iwzOlJrDPi5FH7ZEZStUv6WsclZyCjrcguhlAI+wYacPHh645yunvk6sMuS3mJXabAlS01Y5Dg2YJ5WIpaxoEadCoEmMgYJ0=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 9786fb266a4a0ba7e741af4014ef6d27_043bcd2ede5211f19232525400248c00
-    ReservedCode2: 0nqUgkO5QeWgrqQOJ0SDzcevco2bggDKexc3SG8esRhJOhNxi2Oz5KWxyQE2t5W3o2TJ4jMnypUyuwZZ/h41If1DKu9iwzOlJrDPi5FH7ZEZStUv6WsclZyCjrcguhlAI+wYacPHh645yunvk6sMuS3mJXabAlS01Y5Dg2YJ5WIpaxoEadCoEmMgYJ0=
----
-
 # workmom —— WorkBuddy 账号 / 模型 总控（自研，不依赖 WorkDaddy）
 
 一个本地小工具集，把 WorkBuddy 桌面端的「账号」和「模型」拆成两个互不干扰的维度来管：
@@ -28,67 +17,103 @@ workmom 把这两件事拆开，并且把 WorkBuddy 已经登录好的渲染进�
 - Claude Code、Codex CLI、各类 OpenAI 兼容客户端只要把 base_url 指过来，就能借 WorkBuddy 的额度干活；
 - 账号、模型各自独立切换，互不影响；额度爆了自动换号，客户端全程无感。
 
-## 一、环境准备与首次部署
+## 一、装起来（两步）
 
-| 前提 | 要求 |
-| --- | --- |
-| 系统 | Windows 10/11（依赖 WorkBuddy 桌面端 + CDP） |
-| Python | 3.9+（标准库 + `websocket-client`、`cryptography`） |
-| WorkBuddy | 已安装并至少登录一个账号，且**启动时必须带 CDP 端口** |
+前面不需要看别的东西，就两步。
 
-**WorkBuddy 必须带调试端口启动**，否则一切免谈：
+**第 1 步：双击 `setup.bat`**
+
+它会把该做的事一次做完，全程中文提示，缺什么当场问你：
+
+| 步骤 | 做什么 | 出问题会怎样 |
+| --- | --- | --- |
+| 1 | 检查 Python 版本（要 3.9+）和目录完整性 | 提示去哪装、装的时候要勾什么 |
+| 2 | 检查并安装 `websocket-client`、`cryptography` | 给出换清华源重试的命令 |
+| 3 | **自动定位 WorkBuddy.exe**（注册表 → 常见目录 → 运行中进程 → App Paths） | 给下载地址，也可手工粘路径 |
+| 4 | 生成 `config.json`（保留你改过的项）和 `pythonw.txt` | 坏掉的 config 改名 `.broken` 保留，不删 |
+| 5 | 检查 CDP 调试端口，不通会先问你 | 给出手动启动命令 |
+| 6 | 拉起反代跑一次 `/health` 自检 | 告诉你去哪个日志里找 |
+| 7 | 在桌面建 `workmom` 快捷方式 | 提示直接双击 `start_all.vbs` |
+
+两个以前最劝退的点，现在都不用管了：
+
+- **WorkBuddy 装在哪都行。** 以前要手工把 `wb_exe` 改成实际路径，而这台机器可能装在 D 盘、E 盘或改过文件夹名。现在脚本从注册表卸载信息、App Paths、常见安装目录、正在运行的进程四个地方找，找到就自动写进配置。
+- **调试端口不用自己加参数。** 以前必须手动退出 WorkBuddy，再用命令行带 `--remote-debugging-port=9226` 启动。现在脚本检测到端口不通会**先问你**：WorkBuddy 在跑就问「要重启它吗（默认否）」，没跑就问「现在启动吗」。关掉它会丢未保存的东西，所以默认不替你做主。
+
+**第 2 步：双击桌面的 `workmom` 快捷方式**
+
+等价于双击仓库里的 `start_all.vbs`，一把拉起反代 + 守护 + 面板。浏览器打开 `http://127.0.0.1:18793` 就是面板。
+
+要在 Claude Code / Codex CLI / Marvis 里用，把 base_url 指向 `http://127.0.0.1:18793`，详见「四·五」。
+
+**就这两步。** 下面是备查细节。
+
+### 手工部署（不想用脚本，或脚本卡住时）
 
 ```powershell
-# 常见安装位置，换成你自己的实际路径
-& "$env:LOCALAPPDATA\Programs\WorkBuddy\WorkBuddy.exe" --remote-debugging-port=9226
-```
-
-验证：浏览器打开 `http://127.0.0.1:9226/json/version` 能返回 JSON 即通。想常驻就改快捷方式的目标，
-在 exe 路径后加 ` --remote-debugging-port=9226`，或用 `boot_silent.vbs` 接管启动。
-
-**部署四步**（下面 `D:\workmom` 只是示例，换成你 clone 下来的实际目录）
-
-```powershell
-cd <你clone下来的目录>
+cd <你 clone 下来的目录>
 pip install -r requirements.txt
-copy config.example.json config.json     # 再改里面的 wb_exe 等本机路径
+copy config.example.json config.json     # wb_exe 留空也行，运行时会自动探测
 python server.py 18793                   # 反代
 python dashboard.py                      # 总控面板（另开窗口）
 ```
+
+同一个脚本的非交互用法：
+
+```powershell
+python setup.py                # 交互式，等同双击 setup.bat
+python setup.py -y             # 全用默认值；关 WorkBuddy 这类动作仍然默认不执行
+python setup.py --no-selftest  # 跳过第 6 步反代自检
+python setup.py --no-shortcut  # 不建桌面快捷方式
+```
+
+脚本是幂等的，重复跑不会破坏已有配置，随时可以再来一次。
+
+**WorkBuddy 必须带调试端口启动**（用 `setup.bat` 会自动处理，手工部署时的验证方法）：
+
+```powershell
+# 路径换成你自己的实际位置，不知道在哪就直接搜 WorkBuddy.exe
+& "D:\Nworkbuddy\WorkBuddy.exe" --remote-debugging-port=9226
+```
+
+浏览器打开 `http://127.0.0.1:9226/json/version` 能返回 JSON 即通。想常驻就改快捷方式的目标，在 exe 路径后加
+` --remote-debugging-port=9226`，或用 `boot_silent.vbs` 接管启动。
 
 想后台常驻：双击 `start_all.vbs`（反代 + 守护 + 面板），或把 `boot_silent.vbs` 的快捷方式丢进
 `shell:startup` 做开机静默自启。
 
 **pythonw 从哪来**：几个 `run_*.vbs` 按顺序找解释器——同目录 `pythonw.txt`（一行，写 pythonw.exe 的完整路径）
 → 同目录 `.venv\Scripts\pythonw.exe` → 系统 `PATH`。都没有时不会弹窗，而是把原因写进
-`logs/launch_error.log`。装了 Marvis 之类自带 Python 的客户端，把它的 `pythonw.exe` 路径写进
-`pythonw.txt` 就行。所有 `.vbs` 只依赖脚本自身所在目录，不写死盘符。
-
-**哪些文件是机密**
-
-`config.json`、`data/accounts/*.info`、`data/checkin.json`、`guard_state.json`、`rate_limit_ledger.json`
-含账号凭证或本机路径，已在 `.gitignore` 里排除，**不要提交、不要截图外发**。
-轮换队列里的账号 uid 也放在 `data/guard_queue.json`（不入库），格式见该文件注释。
+`logs/launch_error.log`。`setup.bat` 会自动把 `pythonw.txt` 写好；装了 Marvis 之类自带 Python 的客户端，
+想换成它的 `pythonw.exe`，改这一个文件就行。
 
 ## 一·五、别人 clone 下来能直接用吗
 
-**代码层面能**，但有四个属于「机器自己」的前提，缺一个就跑不通：
+**能，双击 `setup.bat` 就行。** 以前有四道手工门槛，现在都被脚本接管了：
+
+| 以前要你手工做的事 | 现在 |
+| --- | --- |
+| 自己找出 WorkBuddy 装在哪，改 `wb_exe` | 四路自动探测（注册表 / 常见目录 / 运行中进程 / App Paths），装任意盘都认 |
+| 自己退出 WB，再用命令行带 `--remote-debugging-port=9226` 重启 | 检测端口，不通会问你要不要重启，并自带等待就绪（最多 120 秒） |
+| 自己 `pip install -r requirements.txt` | 自动检查缺哪个装哪个，失败给换源命令 |
+| 自己 `copy config.example.json config.json` 再逐项改 | 自动生成，保留已改过的值；解析失败的文件改名 `.broken` 留证，不删 |
+
+剩下真正属于「这台机器自己」的、脚本没法替你解决的：
 
 | 前提 | 缺了会怎样 |
 | --- | --- |
-| 本机装了 WorkBuddy，并登录了**你自己的**账号 | 拿不到登录态和密钥，请求全部失败 |
-| WorkBuddy 带 `--remote-debugging-port=9226` 启动 | `/health` 里 `cdp` = error 且带 `hint`，请求直接报错 |
-| Python 3.9+ 且 `pip install -r requirements.txt` | `ModuleNotFoundError: websocket` / `cryptography` |
-| `copy config.example.json config.json`，把 `wb_exe` 改成本机实际路径 | 面板的切号 / 重启 WB 找不到程序（反代走 CDP，不依赖这个路径） |
-| 端口 9226、18793 没被占用 | 被占就改 `cdp_port` / `relay_port`，**两处要一致** |
+| 本机装了 WorkBuddy，并登录了**你自己的**账号 | 拿不到登录态和密钥，请求全部失败（脚本会提示没装并给下载地址） |
+| 端口 9226、18793 没被占用 | 被占就在 `config.json` 改 `cdp_port` / `relay_port`，**两处要一致** |
+| 账号本身有可用额度 | 这是 WorkBuddy 官方账号体系决定的，跟本仓库无关 |
 
 **仓库里没有任何个人数据**：`config.json`、`data/`、`logs/`、`backups/`、`guard_state.json`、
 `rate_limit_ledger.json`、`pythonw.txt` 全在 `.gitignore`，`git clone` 下来是干净的，不会带出别人的账号 uid 或本机路径。
 
-**这版专门修掉的两个「下了用不了」**：
+**这版专门修掉的三个「下了用不了」**：
 
 - `CDP_PORT` 以前写死 9226，`config.json` 里改 `cdp_port` 不生效（9226 被占用的人直接废）→ 现在真的读 config；
-- `config.json` 带 BOM（Windows 记事本 / PowerShell 存盘默认带 BOM）时配置会被静默吞掉，改了不生效 → 现在按 `utf-8-sig` 读。
+- `config.json` 带 BOM（Windows 记事本 / PowerShell 存盘默认带 BOM）时配置被静默吞掉，改了不生效 → 现在按 `utf-8-sig` 读；
+- `wb_exe` 只认 `%LOCALAPPDATA%\Programs\WorkBuddy` 一种安装位置，装在别的盘就找不到 → 现在四路探测，找不到还会在运行时自动回填。
 
 **做不到的事**：WorkBuddy 官方接口或密钥机制一旦变化，上游调用就会挂。这不在本仓库能控制的范围，
 届时更新 `workmom_core.py` 的探测 / 解密逻辑。
@@ -111,6 +136,8 @@ python dashboard.py                      # 总控面板（另开窗口）
 | `relay_protocols.py` | 三协议转换层：Anthropic Messages / OpenAI Responses ↔ OpenAI Chat（含流式事件序列） |
 | `config.example.json` | 配置模板，复制成 `config.json` 再改 |
 | `pythonw.txt` | （可选，不入库）一行写死 pythonw.exe 路径，供 `.vbs` 启动器使用 |
+| `setup.bat` | **一键初始化入口，双击这个即可**。纯 ASCII + CRLF，只负责找 Python 并调 `setup.py` |
+| `setup.py` | 初始化脚本本体：定位 WB、生成配置、装依赖、查 CDP、跑自检、建快捷方式（可重复执行） |
 | `requirements.txt` | 运行依赖，只有两个第三方包 |
 | `docs/ARCHITECTURE.md` | 架构与实现要点：链路、协议层、加密、切号原理、踩过的坑、自测清单 |
 | `CHANGELOG.md` | 更新记录 |
@@ -120,7 +147,8 @@ python dashboard.py                      # 总控面板（另开窗口）
 
 | 操作 | 方式 |
 | --- | --- |
-| 全量启动（反代 + 守护 + 面板） | 桌面 `workmom 一键启动.lnk` → `start_all.vbs` |
+| 全量启动（反代 + 守护 + 面板） | 桌面 `workmom` 快捷方式（`setup.bat` 自动创建）→ `start_all.vbs` |
+| 首次安装 / 重装 / 配置坏了 | 双击 `setup.bat`，幂等，随时可重跑 |
 | 只开面板 | 桌面 `workmom 总控面板.lnk` → `run_panel.vbs` |
 | 开机自启（静默，只反代+守护，不弹面板） | 启动文件夹 `workmom 自启.lnk` → `boot_silent.vbs` |
 | 全停 | `stop_all.bat`（只杀**本目录**下的 python 进程，按 `%~dp0` 定位，不认盘符） |
@@ -184,6 +212,9 @@ python dashboard.py                      # 总控面板（另开窗口）
 
 | 现象 | 先看哪 |
 | --- | --- |
+| 双击 `setup.bat` 窗口一闪就没 | 多半是没装 Python 或没勾 Add to PATH。开个 cmd 把 bat 拖进去运行，就能看到报错 |
+| `setup.bat` 说没找到 WorkBuddy | 先装 WorkBuddy；脚本会问你要路径，也可以自己在 `config.json` 填 `wb_exe`（留空则运行时自动探测） |
+| `setup.bat` 说 CDP 不通、自检失败 | 按它打印的手动命令带 `--remote-debugging-port=9226` 重启 WorkBuddy，再跑一次 `setup.bat` |
 | 反代没起来 / `端口监听 False` | `logs/relay.out.log`、`logs/relay.err.log`；多半是端口被旧进程占着，跑 `stop_all.bat` 再起 |
 | 切号没反应 | `logs/workmom.log` 里找「无感切号完成」；失败时看是不是 CDP 9226 不通（WorkBuddy 没带 `--remote-debugging-port=9226` 启动） |
 | 领积分说"已签到" | 正常，`data/checkin.json` 里已有当天记录，别重复请求 |

@@ -1,5 +1,5 @@
 {
-  "wb_exe": "C:\\Users\\<you>\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe",
+  "wb_exe": "",
   "cdp_port": 9226,
   "cdp_timeout_sec": 300,
   "api_host": "https://www.workbuddy.cn",

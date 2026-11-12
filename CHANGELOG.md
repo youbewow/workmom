@@ -1,15 +1,41 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 9786fb266a4a0ba7e741af4014ef6d27_05237d1fde5211f19280525400393706
-    ReservedCode1: XO/fHg9sVibmzyZBp3WfGJSVnjDSPxZGBLCfZUmnrf7mlldWqShPaTuOA/uH74KxMbpq+zrqhauBWRAr+cUP2V8KSMzPaGAZVctvQt/OIR72QS3Tjfs4EQd3UE1VxNOWoxpdkBYXkTKaezdbi+CHL3eIh382hXPGELyBZm7mNLDak7xNHGWCpUW6S2I=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 9786fb266a4a0ba7e741af4014ef6d27_05237d1fde5211f19280525400393706
-    ReservedCode2: XO/fHg9sVibmzyZBp3WfGJSVnjDSPxZGBLCfZUmnrf7mlldWqShPaTuOA/uH74KxMbpq+zrqhauBWRAr+cUP2V8KSMzPaGAZVctvQt/OIR72QS3Tjfs4EQd3UE1VxNOWoxpdkBYXkTKaezdbi+CHL3eIh382hXPGELyBZm7mNLDak7xNHGWCpUW6S2I=
----
-
 # 更新记录
+
+## 0.4.0 — 2026-11-12
+
+**一键安装：把「怎么用」从五个手工步骤压成双击一次**
+
+以前 clone 下来要自己找 WorkBuddy 路径、自己带参数重启 WB、自己装依赖、自己复制改 config，
+这四件事劝退了绝大多数人。0.4.0 全部接管。
+
+新增：
+- `setup.bat` / `setup.py` —— 一键初始化，七步走完：检查 Python 版本与目录完整性 → 装依赖 →
+  **自动定位 WorkBuddy** → 生成 `config.json` 与 `pythonw.txt` → 检查 CDP 端口 → 跑反代 `/health` 自检 →
+  建桌面快捷方式。
+  - 幂等：可反复执行，已改过的配置项不会被覆盖
+  - 解析失败的 `config.json` 改名 `.broken` 留证，**不删除**
+  - `setup.bat` 纯 ASCII + CRLF，`chcp 65001` 保证中文不乱码；`setup.py` 也可直接跑
+  - `-y` 无人值守；`--no-selftest` / `--no-shortcut` 跳过最后两步
+- `workmom_core._guess_wb_exe()` 升级为**四路探测 + 进程内缓存**：
+  注册表（`App Paths` + 卸载信息 `DisplayIcon` / `InstallLocation`）→ 常见安装目录 →
+  运行中 `WorkBuddy.exe` 进程路径 → 兜底。装在 D 盘 / E 盘 / 改过文件夹名的都能认出来
+  （实测注册表路径命中耗时约 2ms）
+- `workmom_core.DEF["wb_exe"]` 默认改空串，`cfg()` 读到空值自动探测回填；
+  `workmom_guard.load_cfg()` 同样兜底 —— **`wb_exe` 现在可以不填了**
+- `config.example.json` 的 `wb_exe` 由示例路径改为空串
+
+安全约束：
+- 关闭 WorkBuddy 有副作用（会丢未保存内容），`setup` 检测到 CDP 端口不通时**只询问、不擅自执行**；
+  WorkBuddy 正在运行时这个问题的默认答案是「否」，并打印手动启动命令供复制
+
+文档：
+- README 第一节重写为「装起来（两步）」：双击 `setup.bat` → 双击桌面 `workmom`。
+  手工部署与 `setup.py` 参数降级为备查小节
+- README「一·五」重写：原来五个手工前提改为「已由脚本接管」对照表，只保留真正剩下的前置条件
+- README 清除文件头遗留的 AIGC 元数据；CHANGELOG 同步清除
+- README 的文件说明 / 启动停止 / 排障三张表补充 `setup` 相关条目
+
+不改的东西：反代与协议层（`server.py`、`relay_protocols.py`）**零改动**，老用户升级后行为完全一致。
+
 
 ## 0.3.1 — 2026-11-12
 

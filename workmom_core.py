@@ -43,24 +43,157 @@ KEY_PROBE_JS = os.path.join(DATA, "_keyprobe.js")
 APP_NAME = "workmom"
 
 
-def _guess_wb_exe():
-    """按常见安装位置探测 WorkBuddy 主程序；探测不到返回空串，由 config.json 兜底。"""
-    la = os.environ.get("LOCALAPPDATA") or ""
-    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
-    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
-    cands = [
-        os.path.join(la, "Programs", "WorkBuddy", "WorkBuddy.exe") if la else "",
-        os.path.join(pf, "WorkBuddy", "WorkBuddy.exe"),
-        os.path.join(pf86, "WorkBuddy", "WorkBuddy.exe"),
-    ]
-    for c in cands:
-        if c and os.path.exists(c):
-            return c
+_WB_EXE_CACHE = {"v": None}
+_WB_IMAGE = "WorkBuddy.exe"
+
+
+def _wb_exe_from_registry():
+    """从注册表找 WorkBuddy：App Paths → 卸载信息 DisplayIcon / InstallLocation。
+
+    WorkBuddy 允许自定义安装目录（D:\\xxx 这类），靠枚举常见路径必然漏，
+    但装过它的机器在卸载信息里一定留着 DisplayIcon 完整路径且与盘符、目录名无关，
+    所以把它作为首选探测手段。只读，无副作用。
+    """
+    try:
+        import winreg
+    except Exception:
+        return ""
+
+    def _as_exe(raw):
+        p = str(raw or "").strip().strip('"')
+        if "," in p:                     # DisplayIcon 形如 "D:\\x\\WorkBuddy.exe,0"
+            p = p.split(",")[0]
+        p = p.strip().strip('"')
+        return p if p and os.path.basename(p).lower() == _WB_IMAGE.lower() and os.path.isfile(p) else ""
+
+    roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
+    views = (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY, 0)
+
+    # 1) App Paths
+    for root in roots:
+        for view in views:
+            try:
+                k = winreg.OpenKey(root,
+                                   r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + _WB_IMAGE,
+                                   0, winreg.KEY_READ | view)
+                p = _as_exe(winreg.QueryValueEx(k, "")[0])
+                if p:
+                    return p
+            except Exception:
+                pass
+
+    # 2) 卸载信息：DisplayName 含 workbuddy 的条目
+    for root in roots:
+        for view in views:
+            try:
+                base = winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                                      0, winreg.KEY_READ | view)
+            except Exception:
+                continue
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(base, i)
+                except OSError:
+                    break
+                i += 1
+                try:
+                    sk = winreg.OpenKey(base, sub)
+                    name = str(winreg.QueryValueEx(sk, "DisplayName")[0] or "")
+                except Exception:
+                    continue
+                if "workbuddy" not in name.lower():
+                    continue
+                for field in ("DisplayIcon", "InstallLocation"):
+                    try:
+                        val = str(winreg.QueryValueEx(sk, field)[0] or "")
+                    except Exception:
+                        continue
+                    p = _as_exe(val)
+                    if p:
+                        return p
+                    if val.strip():
+                        cand = os.path.join(val.strip().strip('"'), _WB_IMAGE)
+                        if os.path.isfile(cand):
+                            return cand
     return ""
 
 
+def _wb_exe_from_common_paths():
+    """常见安装目录兜底枚举（覆盖安装器默认位置 + 各盘根下常见目录名）。"""
+    la = os.environ.get("LOCALAPPDATA") or ""
+    ad = os.environ.get("APPDATA") or ""
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    pd = os.environ.get("ProgramData") or r"C:\ProgramData"
+
+    direct = [os.path.join(la, "Programs", "WorkBuddy", _WB_IMAGE) if la else "",
+              os.path.join(la, "WorkBuddy", _WB_IMAGE),
+              os.path.join(ad, "WorkBuddy", _WB_IMAGE),
+              os.path.join(pf, "WorkBuddy", _WB_IMAGE),
+              os.path.join(pf86, "WorkBuddy", _WB_IMAGE),
+              os.path.join(pd, "WorkBuddy", _WB_IMAGE)]
+    for c in direct:
+        if c and os.path.isfile(c):
+            return c
+
+    # 各盘根目录下的常见目录名（自定义安装常落在这里，如 D:\\Nworkbuddy）
+    dirnames = ("WorkBuddy", "workbuddy", "Nworkbuddy", "WorkBuddyApp", "工作助手")
+    for base in ("C:\\", "D:\\", "E:\\", "F:\\"):
+        if not os.path.isdir(base):
+            continue
+        for n in dirnames:
+            p = os.path.join(base, n, _WB_IMAGE)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def _wb_exe_from_process():
+    """从正在运行的 WorkBuddy 进程取 exe 路径。最准，但要拉起 PowerShell，放最后兜底。"""
+    if os.name != "nt":
+        return ""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-Process -Name WorkBuddy -ErrorAction SilentlyContinue | "
+             "Where-Object { $_.Path } | Select-Object -First 1).Path"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, creationflags=0x08000000)
+        p = (r.stdout or "").strip().splitlines()
+        p = p[-1].strip() if p else ""
+        if p and os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    return ""
+
+
+def _guess_wb_exe():
+    """探测 WorkBuddy 主程序路径；探测不到返回空串。
+
+    顺序：注册表（对自定义安装盘最有效）→ 常见目录 → 运行中进程（慢，兜底）。
+    结果缓存，避免 server / dashboard / guard 反复探测。
+    注意：config.json 里显式写了 wb_exe 的永远优先，本函数只是没配时的兜底。
+    """
+    if _WB_EXE_CACHE["v"] is not None:
+        return _WB_EXE_CACHE["v"]
+    found = ""
+    for fn in (_wb_exe_from_registry, _wb_exe_from_common_paths, _wb_exe_from_process):
+        try:
+            found = fn()
+        except Exception:
+            found = ""
+        if found:
+            break
+    _WB_EXE_CACHE["v"] = found
+    return found
+
+
 DEF = {
-    "wb_exe": _guess_wb_exe(),
+    # 留空表示由 _guess_wb_exe() 自动探测（比写死路径可移植）；
+    # config.json 里显式写了就以此为准，setup.bat 会帮你写进去
+    "wb_exe": "",
     "cdp_port": 9226,
     "api_host": "https://www.workbuddy.cn",   # 国内版；国际版填 https://www.workbuddy.ai
     "oauth_platform": "workbuddy",
@@ -92,6 +225,9 @@ def cfg():
                 c.update(json.load(f) or {})
         except Exception:
             pass
+    # wb_exe 没配（或配了空串）时自动探测，保证 clone 下来不改配置也能跑
+    if not c.get("wb_exe"):
+        c["wb_exe"] = _guess_wb_exe()
     return c
 
 
