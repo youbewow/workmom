@@ -15,6 +15,8 @@
 - `workmom_guard.py`：`config.json` 没显式写 `relay_base` 时，用 `relay_port` 自动拼出反代地址，
   不再默认钉死 18793
 - `setup.py` 跑完的「下一步」提示改用实际 `relay_port`，不再固定印 18793
+- `GET /health` 新增 `relay_port` / `relay_base` 两个字段：排查「到底听在哪个端口」时
+  不用再猜，浏览器打开就知道
 
 setup 自检增强：
 - 判断反代是否在跑时，除了 `/health` 通不通，还核对响应里的 `"app": "workmom"`，
@@ -24,6 +26,11 @@ setup 自检增强：
 实测（副本 + `relay_port=18899`）：首次运行自动拉起并绑 18899，`/health` 正常，退出码 0；
 重复运行识别「已在运行」不重复启动；双开同一端口退出码 2 并给出说明；
 `relay_port` 指向 WorkBuddy 的 9226 时准确报「已被别的程序占用」，退出码 1。
+
+陌生人路径实测（从 GitHub 匿名 `Download ZIP` 解压，目录内**没有 `.git`**，等同外部用户）：
+`setup.bat -y` 七步全绿、耗时 7.4s、退出码 0，自动认出 `D:\Nworkbuddy\WorkBuddy.exe`，
+按改过的 `relay_port=18899` 拉起反代并绑定成功，`POST /v1/chat/completions` 端到端真的出字。
+ZIP 包内 `*.vbs` / `*.bat` 被 GitHub 按 `.gitattributes` 正确还原成 CRLF（VBScript 必须）。
 
 ## 0.4.0 — 2026-11-12
 

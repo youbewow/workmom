@@ -516,6 +516,8 @@ class Handler(BaseHTTPRequestHandler):
             _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
             _wb = str(_cfgval("wb_exe", "") or "")
             return self._json(200, {"status": "ok", "app": "workmom", "cdp": up, "hint": hint,
+                                    "relay_port": self.server.server_address[1],
+                                    "relay_base": "http://127.0.0.1:%d" % self.server.server_address[1],
                                     "cdp_port": CDP_PORT,
                                     "cdp_timeout_sec": CDP_TIMEOUT_SEC,
                                     "config_file": _cfg_path,
