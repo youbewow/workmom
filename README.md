@@ -341,9 +341,15 @@ python workmom_guard.py --quota-check
 三个坑一次填掉：
 
 **1. 额度摊到面板上，不再只有当前号一个数字。**
-`/relay_state` 增加 `quotas_by_uid`（全账号全模型明细）、`uid`、`last_pro_6004_uid`；
-守护按 `quota_sweep_secs`（默认 600 秒）做**全号巡检**。面板新增「额度已用」列：
-`84%` 正常 / 黄色预警 / ≥99.5% 红；没探到数据就显示 `—`，不会留空行。
+面板「额度已用」有两个数据源，按可信度排：
+
+| 来源 | 谁写的 | 覆盖范围 | 优先级 |
+| --- | --- | --- | --- |
+| 反代实测 | 反代每次成功响应顺手记上游 `usage.quota` → `/relay_state` 的 `quotas_by_uid` | 只覆盖**真正被用过**的号 | 高（最准） |
+| 守护探测 | `quota_sweep_secs`（默认 600 秒）一轮全号巡检，落 `data/quota_probe_cache.json`，2 小时内有效 | 覆盖**号池全部**账号 | 低（兜底） |
+
+`/relay_state` 同时带 `uid`（当前有效号）与 `last_pro_6004_uid`（最近一次撞 6004 的是哪个号）。
+面板显示 `84%` 正常 / 黄色预警（过 `quota_warn_percent`）/ ≥99.5% 红；两个源都没有就显示 `—`，不会留空行。
 
 **2. 撞 6004 只换账号，绝不换模型。**
 `server.py` 里 429/6004 不再走 `fallback_models` 降级（那会把同一条上下文丢给另一个模型，还会把
@@ -370,6 +376,7 @@ python workmom_guard.py --quota-check
 | 切号没反应 | `logs/workmom.log` 里找「无感切号完成」；失败时看是不是 CDP 9226 不通（WorkBuddy 没带 `--remote-debugging-port=9226` 启动） |
 | 面板「额度已用」列一直显示 `—` | 守护还没跑过一轮额度巡检（等 `quota_sweep_secs`，默认 10 分钟），或探测被上游拒。手动触发一次：`python workmom_guard.py --quota-check`（零副作用）或加 `--probe` 实打一次；看 `logs/workmom.log` 里有没有「全号额度」相关行 |
 | 面板刷新一下就不动了 / 按钮全失灵 | 0.5.2 已修（列数与数据长度不等导致 `_tick` 抛异常中断）。若仍出现：看 `logs/panel_error.log` 最新一行；确认跑的是新进程，`stop_all.bat` 后重起 |
+| 日志里切号成功刚 10 秒就又报「额度 93% 超阈值但暂不动」 | 正常。切号瞬间反代进程还按旧号视角回 `/relay_state`，那几秒读到的仍是旧号残留读数；`current_quota` 有 uid 校验 + `quota_stale_since` 双重过滤，判不出当前号就 `None` 不动，不会瞎切。等反代刷新到新号即恢复（通常十几秒），想立刻确认跑 `--quota-check` |
 | 每轮输入 token 都很大，像历史被重发了一整遍 | 先确认瘦身是开着的：`curl -s http://127.0.0.1:18793/health` 看 `slim.enabled` 与 `slim.requests` 有没有在涨；再看响应头 `X-WM-Slim-Pct`（省了多少百分比）。如果 `saved_est_total` 一直是 0，多半是 `config.json` 里 `slim_enabled=false` 或进程没重启 |
 | 想确认「额度主动换号」到底判没判、为什么没换 | 跑 `python workmom_guard.py --quota-check`（零副作用，绝不切号）。它会逐条打印：阈值多少、当前号该模型已用多少、距上次换号多久、号池里有没有更干净的号，最后一句结论。四条件缺哪条一目了然 |
 | 领积分说"已签到" | 正常，`data/checkin.json` 里已有当天记录，别重复请求 |
