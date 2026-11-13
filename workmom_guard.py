@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -772,29 +773,61 @@ def probe_quota(cfg, uid, model, ttl=PROBE_TTL, dry=False):
         return None, "", "取不到凭证"
 
     host = (cfg.get("api_host") or "https://www.workbuddy.cn").rstrip("/")
+    # 上游只吃流式：非流式会被 400 11101「Non-stream chat request is currently not supported」
+    # 顶回来 —— 之前面板一直显示不出额度就是因为这个，探测一个号都没成过。
     body = json.dumps({"model": model,
                        "messages": [{"role": "user", "content": "hi"}],
-                       "max_tokens": 1, "stream": False},
+                       "max_tokens": 1, "stream": True},
                       ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         host + "/v2/chat/completions", data=body, method="POST",
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + token,
                  "User-Agent": "Mozilla/5.0 workmom-guard",
-                 "Accept": "application/json",
+                 "Accept": "text/event-stream",
                  "Accept-Encoding": "identity"})
     pct, reset_at, note = None, "", ""
     try:
         with _OPENER.open(req, timeout=40) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-        data = json.loads(raw) if raw.strip().startswith("{") else {}
-        quota = (data.get("usage") or {}).get("quota") or {}
-        if quota.get("percent") is not None:
-            pct = float(quota["percent"])
-            ra = str(quota.get("reset_at") or "")
+            quota_hit, err_obj, lines = None, None, 0
+            for raw_line in resp:
+                lines += 1
+                if lines > 5000:      # max_tokens=1，正常几行就完，防呆上限
+                    break
+                line = raw_line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                if payload == b"[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("error"):
+                    err_obj = obj.get("error")
+                q = (obj.get("usage") or {}).get("quota")
+                if isinstance(q, dict) and q.get("percent") is not None:
+                    quota_hit = q
+        if quota_hit:
+            pct = float(quota_hit["percent"])
+            ra = str(quota_hit.get("reset_at") or "")
             reset_at = (time.strftime("%m-%d %H:%M", time.localtime(int(ra)))
                         if ra.isdigit() else ra)
-        note = "直连探测"
+            note = "流式探测"
+        elif err_obj:
+            code = str((err_obj or {}).get("code") or "")
+            if code in ("6004", "429"):
+                pct, note = 100.0, "429/6004 已满"
+            else:
+                note = "上游错误 %s: %s" % (code or "-",
+                                          str((err_obj or {}).get("message") or "")[:70])
+        else:
+            note = "流里没有 quota"
     except urllib.error.HTTPError as e:
         try:
             raw = e.read().decode("utf-8", "replace")
@@ -818,6 +851,40 @@ def probe_quota(cfg, uid, model, ttl=PROBE_TTL, dry=False):
                                           "满" if pct == 100.0 else "%s%%" % pct if pct is not None else "?",
                                           note))
     return pct, reset_at, note
+
+
+_SWEEPING = False
+
+
+def sweep_quotas(cfg, rs=None):
+    """把队列里每个号在当前模型上的额度都探一遍，落进 data/quota_probe_cache.json。
+
+    面板靠它显示「哪个号额度已经耗尽」——只靠反代实测的话，没被请求过的号永远是空白。
+    只探缓存过期（> PROBE_TTL）的号，且每个号就 1 个 token 的请求，烧不了多少。
+    """
+    rs = rs if rs is not None else relay_state(cfg)
+    model = (rs or {}).get("model") or _active_model(cfg.get("default_model") or "")
+    if not model:
+        return 0
+    q = cfg.get("queue") or _load_queue(cfg)
+    cache = _qprobe_load()
+    now = int(time.time())
+    n = 0
+    for uid in q:
+        key = "%s|%s" % (uid, model)
+        hit = cache.get(key)
+        if isinstance(hit, dict) and now - int(hit.get("at") or 0) <= PROBE_TTL:
+            continue
+        pct, rst, note = probe_quota(cfg, uid, model)
+        n += 1
+        if pct is not None and pct >= 99.5:
+            log("额度巡检：号 %s 已耗尽（%.0f%%%s）—— 面板会标红" %
+                (uid[:12], pct, ("，" + rst + " 重置") if rst else ""))
+        elif pct is None:
+            log("额度巡检：号 %s 探不到（%s）" % (uid[:12], note))
+    if n:
+        log("额度巡检完成：本轮探了 %d 个号（模型 %s）" % (n, model))
+    return n
 
 
 def _all_quota_low(cfg, rs, th, st):
@@ -1039,28 +1106,50 @@ def main():
                 time.sleep(cfg["poll_interval"])
                 continue
 
-            # 3) 6004 检测
+            # 3) 6004 检测 —— 上游亲口说「这个号额度没了」，属于紧急事件，不吃额度冷却
             if rs:
-                st["current_uid"] = rs.get("uid") or st.get("current_uid")
-                hit_at = rs.get("last_pro_6004_at") or 0
-                cool_ok = time.time() - (st.get("last_switch_at") or 0) > cfg["cooldown"]
-                backoff_ok = time.time() > (st.get("backoff_until") or 0)
-                if hit_at and hit_at > handled and cool_ok:
-                    if not backoff_ok:
-                        left = int(st["backoff_until"] - time.time())
-                        log("检测到 pro 6004，但还在退避期（剩 %ds），暂不切号" % left)
-                    else:
-                        log("检测到 pro 6004（%s），开始自动换号" %
-                            time.strftime("%m-%d %H:%M:%S", time.localtime(hit_at)))
-                        switch_next(cfg, st, reason="6004", dry=dry)
-                        if "--once" in args:
-                            handled = hit_at
-                            st["handled_6004_at"] = handled
-                            save_state(st)
-                            break
-                    handled = hit_at
-                    st["handled_6004_at"] = handled
+                ruid = rs.get("uid") or ""
+                if ruid and ruid != (st.get("current_uid") or ""):
+                    # 插队换号：面板双击、手动 --next、上一轮 switch_next 成功，反代的 uid 都会先变。
+                    # 这里立刻同步基线，否则守护会拿"旧号 + 新号"混着判断，刚切过去就又判死。
+                    log("检测到已切到新号 %s（原 %s），同步基线" %
+                        (ruid[:12], (st.get("current_uid") or "-")[:12]))
+                    st["current_uid"] = ruid
+                    st["quota_stale_since"] = time.time()   # 旧号额度从此刻起一律不算数
                     save_state(st)
+                hit_at = rs.get("last_pro_6004_at") or 0
+                hit_uid = rs.get("last_pro_6004_uid") or ""
+                try:
+                    min_6004 = float(cfg.get("switch_6004_min_secs") or 45)
+                except Exception:
+                    min_6004 = 45.0
+                since_6004 = time.time() - (st.get("last_6004_switch_at") or 0)
+                backoff_ok = time.time() > (st.get("backoff_until") or 0)
+                if hit_at and hit_at > handled:
+                    if hit_uid and ruid and hit_uid != ruid:
+                        log("6004 属于旧号 %s，现在已经在 %s 上了，不切" % (hit_uid[:12], ruid[:12]))
+                        handled = hit_at
+                        st["handled_6004_at"] = handled
+                        save_state(st)
+                    elif not backoff_ok:
+                        left = int((st.get("backoff_until") or 0) - time.time())
+                        log("检测到 pro 6004，但整队退避中（剩 %ds），先不处理（不吃掉这条）" % left)
+                    elif since_6004 < min_6004:
+                        log("检测到 pro 6004，但距上次 6004 换号仅 %.0fs（需 %.0fs），等下一轮"
+                            % (since_6004, min_6004))
+                    else:
+                        log("检测到 pro 6004（%s，号 %s）→ 紧急换号，不等常规冷却 %.0fs" % (
+                            time.strftime("%m-%d %H:%M:%S", time.localtime(hit_at)),
+                            (hit_uid or ruid or "-")[:12], cfg["cooldown"]))
+                        st["last_6004_switch_at"] = time.time()
+                        save_state(st)
+                        switch_next(cfg, st, reason="6004", dry=dry)
+                        st["quota_stale_since"] = time.time()
+                        handled = hit_at
+                        st["handled_6004_at"] = handled
+                        save_state(st)
+                        if "--once" in args:
+                            break
 
             # 4) 额度阈值主动换号（B 规则）
             #    不再等撞 6004 —— 撞墙那一次请求本身已经废了，而且撞完才知道墙在哪。
@@ -1078,13 +1167,20 @@ def main():
                 if th > 0 and pct is not None and pct >= th:
                     since = time.time() - (st.get("last_quota_switch_at") or 0)
                     backoff_ok = time.time() > (st.get("backoff_until") or 0)
-                    if since < min_gap:
+                    # 100% 是硬事实（额度真的没了），不再讲究"距上次换号够不够久"，
+                    # 也不再顾忌候选号干不干净 —— 反正留着也打不出东西来。
+                    hard_full = pct >= 99.5
+                    eff_gap = 0 if hard_full else min_gap
+                    if hard_full:
+                        log("当前号 %s 额度已耗尽（%.1f%%，%s 重置）→ 立即换号" %
+                            (qmodel or "?", pct, qreset or "-"))
+                    if since < eff_gap:
                         log("额度 %.1f%% 超阈值 %.0f%%，但距上次额度换号仅 %.0fs（需 %.0fs），暂不动"
-                            % (pct, th, since, min_gap))
+                            % (pct, th, since, eff_gap))
                     elif not backoff_ok:
                         left = int((st.get("backoff_until") or 0) - time.time())
                         log("额度 %.1f%% 超阈值，但整队在退避期（剩 %ds），暂不动" % (pct, left))
-                    elif _all_quota_low(cfg, rs, th, st):
+                    elif (not hard_full) and _all_quota_low(cfg, rs, th, st):
                         log("额度 %.1f%% 超阈值，但队列里没有更干净的号，保守不动（等 6004 兜底）" % pct)
                     else:
                         log("额度预警：当前号 %s 已用 %.1f%% >= 阈值 %.0f%%（%s 重置），主动换下一个号"
@@ -1092,8 +1188,35 @@ def main():
                         st["last_quota_switch_at"] = time.time()
                         save_state(st)
                         switch_next(cfg, st, reason="quota_%.0f%%" % pct, dry=dry)
+                        st["quota_stale_since"] = time.time()
+                        save_state(st)
                         if "--once" in args:
                             break
+
+            # 5) 额度巡检 —— 把所有号的额度都探一遍写进缓存，面板才能说出「哪个号耗尽」。
+            #    放后台线程，别让 8 个号的串行探测拖慢 6004 的响应速度。
+            if not dry:
+                try:
+                    sweep_gap = float(cfg.get("quota_sweep_secs") or 600)
+                except Exception:
+                    sweep_gap = 600.0
+                global _SWEEPING
+                if (time.time() - (st.get("last_sweep_at") or 0) >= sweep_gap
+                        and not _SWEEPING):
+                    _SWEEPING = True
+                    st["last_sweep_at"] = time.time()
+                    save_state(st)
+
+                    def _sweep_bg(c=cfg, r=rs):
+                        global _SWEEPING
+                        try:
+                            sweep_quotas(c, r)
+                        except Exception as e:
+                            log("额度巡检异常: %s: %s" % (type(e).__name__, e))
+                        finally:
+                            _SWEEPING = False
+
+                    threading.Thread(target=_sweep_bg, daemon=True).start()
 
             if "--once" in args:
                 break

@@ -225,6 +225,7 @@ def _record_upstream_error(model, res):
     entry = {
         "at": int(time.time()),
         "model": model,
+        "uid": _cur_uid(),
         "status": res.get("status"),
         "kind": res.get("kind"),
         "code6004": ("6004" in blob),
@@ -897,19 +898,87 @@ def _cdp_res_to_error(res, model):
                       raw=blob, fallbackable=True)
 
 
+# 限流台账：面板的状态列读它。以前反代从不写这个文件，
+# 面板上那张「限流中 / 可用」表其实停留在 11-12 的旧数据上，所以永远显示不出「谁被限了」。
+LEDGER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rate_limit_ledger.json")
+_LEDGER_LOCK = threading.Lock()
+
+
+def _ledger_update(uid, status, err=None, note=""):
+    """只改动这个 uid 的状态位，其它号原样保留（原子替换，避免面板读到半个文件）。"""
+    if not uid:
+        return
+    clear_at, clear_text = 0, ""
+    if err is not None and getattr(err, "reset_at", ""):
+        try:
+            ts = time.mktime(time.strptime(str(err.reset_at)[:19].replace("T", " "),
+                                           "%Y-%m-%d %H:%M:%S"))
+            clear_at = int(ts)
+            clear_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        except Exception:
+            clear_at, clear_text = 0, ""
+    with _LEDGER_LOCK:
+        led = {}
+        try:
+            with open(LEDGER_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                led = d
+        except Exception:
+            led = {}
+        rec = led.get(uid) if isinstance(led.get(uid), dict) else {}
+        rec.update({"status": status, "clear_at": clear_at, "clear_text": clear_text,
+                    "checked_at": int(time.time()), "source": "relay"})
+        if note:
+            rec["note"] = note[:200]
+        elif status == "ok":
+            rec.pop("note", None)
+        led[uid] = rec
+        try:
+            tmp = LEDGER_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(led, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, LEDGER_FILE)
+        except Exception as e:
+            sys.stderr.write("写限流台账失败: %s\n" % e)
+
+
+def _cur_uid():
+    try:
+        return (WM.current_uid() if WM is not None else "") or ""
+    except Exception:
+        return ""
+
+
+def _note_ok(model, uid=None):
+    """一次成功请求 = 这个号目前没被限流，把台账上的限流标记清掉，顺带清它自己的熔断。"""
+    uid = uid or _cur_uid()
+    if not uid:
+        return
+    if WT is not None:
+        try:
+            WT.cooldown_clear(model or "", uid=uid)
+        except Exception:
+            pass
+    _ledger_update(uid, "ok")
+
+
 def _note_error(model, err, channel):
-    """统一记录一次失败（日志 + 熔断 + 状态面板）。"""
+    """统一记录一次失败（日志 + 熔断 + 额度落账 + 限流台账 + 面板状态）。"""
     now = int(time.time())
+    uid = _cur_uid()
     with _DIRECT_LOCK:
         _DIRECT_STAT["fail"] += 1
         _DIRECT_STAT["last_fail_at"] = now
-        _DIRECT_STAT["last_err"] = ("[%s] %s" % (channel, str(err)[:200]))
+        _DIRECT_STAT["last_err"] = ("[%s] %s%s" % (channel, ("%s: " % uid[:8]) if uid else "",
+                                                   str(err)[:200]))
     _record_upstream_error(model, {
         "kind": channel, "status": err.status, "code6004": err.is_quota,
         "detail": str(err)[:300], "body": err.raw[:600],
     })
     if err.is_quota and WT is not None:
-        # 熔断：默认按上游给的重置时间，但至少 60s，最多 30 分钟，避免一直空打上游
+        # 熔断：默认按上游给的重置时间，但至少 60s，最多 30 分钟，避免一直空打上游。
+        # key 带 uid —— 只熔断「这个号 × 这个模型」，换到满额号后不该被这条挡住。
         secs = 120
         if err.reset_at:
             try:
@@ -918,7 +987,19 @@ def _note_error(model, err, channel):
                 secs = max(60, min(1800, int(ts - time.time())))
             except Exception:
                 secs = 600
-        WT.cooldown_set(model, secs, reset_at=err.reset_at, msg=err.message, code=err.code)
+        WT.cooldown_set(model, secs, reset_at=err.reset_at, msg=err.message,
+                        code=err.code, uid=uid)
+        # 上游亲口说额度没了 → 直接把这个号钉成 100%，落盘给面板看，也是守护换号的确凿依据
+        try:
+            WT.note_quota_exhausted(model, reset_at=err.reset_at,
+                                    message=err.message, uid=uid)
+        except Exception:
+            pass
+        _ledger_update(uid, "limited", err=err,
+                       note="额度耗尽/%s：%s" % (err.code or err.status or "429",
+                                              (err.message or "")[:120]))
+    elif uid and err.http in (401, 403):
+        _ledger_update(uid, "invalid", note="鉴权失败：%s" % (err.message or "")[:120])
 
 
 # ----------------------------------------------------------------------------
@@ -952,18 +1033,22 @@ def open_direct(oai_req, hdr_model=None):
 
     for model in chain:
         # 熔断中且不是唯一选项 → 直接跳过（省一次无意义的上游往返）
-        cd = WT.cooldown_get(model)
-        if cd and len(chain) > 1:
+        cd = WT.cooldown_get(model, uid=_cur_uid())
+        if cd:
+            # 额度类熔断（6004/429）是账号问题，绝不拿备用模型顶：
+            # 换模型＝把同一个上下文丢给另一个模型（上次就是这么把上下文搅坏的），
+            # 而且会顺手把备用号也烧掉。直接把真实原因摊给客户端，等 workmom_guard 换号后重试。
+            quota_cd = (str(cd.get("code") or "") in ("6004", "429", "quota")
+                        or any(k in str(cd.get("msg") or "") for k in ("额度", "限流")))
+            if quota_cd or len(chain) == 1:
+                raise RelayError(http=429, type="rate_limit_error", code="6004",
+                                 message=cd.get("msg") or "上游限流中",
+                                 reset_at=cd.get("reset_at") or "",
+                                 retry_after=cd.get("left") or 60, fallbackable=True)
             errors.append(RelayError(http=429, type="rate_limit_error", code="6004",
                                      message="%s 处于限流冷却（剩 %ds）" % (model, cd["left"]),
                                      reset_at=cd.get("reset_at") or "", fallbackable=True))
             continue
-        if cd and len(chain) == 1:
-            # 唯一模型且正在熔断：立刻把真实原因告诉客户端，不再打上游
-            raise RelayError(http=429, type="rate_limit_error", code="6004",
-                             message=cd.get("msg") or "上游限流中",
-                             reset_at=cd.get("reset_at") or "",
-                             retry_after=cd.get("left") or 60, fallbackable=True)
 
         body = build_upstream_body(oai_req, model)
         st = WT.DirectStream(body, model=model, stream=True, timeout=DIRECT_TIMEOUT)
@@ -976,8 +1061,11 @@ def open_direct(oai_req, hdr_model=None):
                              fallbackable=e.fallbackable)
             errors.append(err)
             _note_error(model, err, "direct-open")
-            # 429 / 404（模型不存在）→ 换备用模型；其余（400/401）换模型也没用
-            if err.http in (429, 404) and model != chain[-1]:
+            # 关键修复：429/6004 只说明「这个账号的额度没了」，换模型是把同一个上下文扔给另一个模型，
+            # 上次就是这么把上下文搅坏的（还会顺手把 k3-1/k3-2 这两个同源号模型也烧掉）。
+            # 该换的是账号 —— 由 workmom_guard 看到额度耗尽/6004 后切号。
+            # 只有 404（模型名写错/不存在）才在同一账号内降级到备用模型。
+            if err.http == 404 and model != chain[-1]:
                 continue
             raise err
         except Exception as e:
@@ -1124,6 +1212,11 @@ def _note_usage(model, usage, kind="chat"):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
+    # 这一次真打成了 → 这个号目前是好的：清掉它自己的熔断和台账限流标记
+    try:
+        _note_ok(model)
+    except Exception:
+        pass
 
 
 _load_usage()
@@ -1137,12 +1230,17 @@ def _quota_headers(extra=None):
     try:
         if WT is None:
             return hdrs
-        snap = WT.quota_snapshot() or {}
-        if not snap:
-            return hdrs
         cur = _active_model()
-        item = snap.get(cur)
+        uid = _cur_uid()
+        item = None
+        try:
+            byuid = WT.quota_by_uid() or {}
+        except Exception:
+            byuid = {}
+        if uid:
+            item = (byuid.get(uid) or {}).get(cur)
         if not isinstance(item, dict):
+            snap = WT.quota_snapshot() or {}
             cand = [v for v in snap.values() if isinstance(v, dict) and v.get("percent") is not None]
             item = max(cand, key=lambda v: v.get("at") or 0) if cand else None
         if not isinstance(item, dict) or item.get("percent") is None:
@@ -1152,6 +1250,9 @@ def _quota_headers(extra=None):
         if ra:
             hdrs["X-WM-Quota-Reset"] = ra
         hdrs["X-WM-Quota-Model"] = str(item.get("model") or cur or "")
+        hdrs["X-WM-Quota-Uid"] = str(item.get("uid") or uid or "")
+        if item.get("exhausted"):
+            hdrs["X-WM-Quota-Exhausted"] = "1"
         if float(item.get("percent") or 0) >= QUOTA_SWITCH_PERCENT:
             hdrs["X-WM-Quota-Near-Limit"] = "1"
     except Exception:
@@ -1457,6 +1558,9 @@ class Handler(BaseHTTPRequestHandler):
                 last_ok = _LAST_OK[0]
             pro_6004 = [e for e in errs if e.get("code6004") and "pro" in str(e.get("model") or "")]
             last_pro_6004 = max([e["at"] for e in pro_6004], default=0)
+            last_pro_6004_uid = ""
+            if pro_6004:
+                last_pro_6004_uid = max(pro_6004, key=lambda e: e["at"]).get("uid") or ""
             return self._json(200, {
                 "relay": "ok",
                 "app": "workmom",
@@ -1467,6 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
                 "error_count": len(errs),
                 "last_error": errs[-1] if errs else None,
                 "last_pro_6004_at": last_pro_6004,
+                "last_pro_6004_uid": last_pro_6004_uid,
                 "pro_6004_count": len(pro_6004),
                 "stats": dict(REQ_STATS),
                 "errors": errs[-10:],
@@ -1852,13 +1957,27 @@ def _health_extra():
             cooldowns = WT.cooldown_snapshot()
         except Exception:
             cooldowns = []
-    quotas = {}
+    quotas = {}          # 兼容旧格式：按 model，只放「当前账号」的记录（守护按 model 读）
+    quotas_by_uid = {}   # 全账号明细：{uid: {model: item}}，面板靠它逐行显示额度
     if WT is not None:
         try:
-            quotas = WT.quota_snapshot()
+            snap = WT.quota_snapshot() or {}
+            uid = _cur_uid()
+            for k, v in snap.items():
+                if isinstance(v, dict) and (v.get("uid") or "") == uid:
+                    quotas[v.get("model") or str(k).split("|")[-1]] = v
+            if not quotas:      # 拿不到当前号记录时退回全量，别让守护看到空额度
+                for k, v in snap.items():
+                    if isinstance(v, dict):
+                        quotas[v.get("model") or str(k).split("|")[-1]] = v
         except Exception:
             quotas = {}
+        try:
+            quotas_by_uid = WT.quota_by_uid() or {}
+        except Exception:
+            quotas_by_uid = {}
     return {
+        "uid": _cur_uid(),
         "transport": TRANSPORT,
         "transport_ready": {"direct": WT is not None and RS is not None,
                             "cdp": True},
@@ -1869,6 +1988,7 @@ def _health_extra():
         "cdp_health": cdp,
         "cooldowns": cooldowns,
         "quotas": quotas,
+        "quotas_by_uid": quotas_by_uid,
         "quota_switch_percent": QUOTA_SWITCH_PERCENT,
         "quota_warn_percent": QUOTA_WARN_PERCENT,
         "audit_left": _AUDIT_LEFT[0],

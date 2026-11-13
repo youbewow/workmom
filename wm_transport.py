@@ -261,32 +261,113 @@ def resolve_token(force=False):
 
 # ====================================================================== 配额
 _QUOTA_LOCK = threading.Lock()
-_QUOTA = {}   # model -> {"percent":..,"reset_at":..,"at":ts,"raw":..}
+_QUOTA = {}   # "uid|model" -> {"percent":..,"reset_at":..,"at":ts,...}
+
+# 落盘额度：反代一重启内存就空，面板就再也说不出「哪个号打满了」。
+# 这里把每个「账号×模型」最后一次额度写进 data/quota_last.json，跨重启、跨进程（面板/守护）都能读。
+QUOTA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "quota_last.json")
+_QUOTA_PERSIST = {}
+
+
+def _qkey(uid, model):
+    """额度键 = 账号 × 模型。只按 model 当键会让换号后的旧百分比盖住新号，判死新号。"""
+    return "%s|%s" % (uid or "-", model or "-")
+
+
+def _qpersist_load():
+    global _QUOTA_PERSIST
+    if _QUOTA_PERSIST:
+        return _QUOTA_PERSIST
+    try:
+        with open(QUOTA_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            _QUOTA_PERSIST = d
+    except Exception:
+        _QUOTA_PERSIST = {}
+    return _QUOTA_PERSIST
+
+
+def _qpersist_save():
+    try:
+        d = os.path.dirname(QUOTA_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = QUOTA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_QUOTA_PERSIST, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, QUOTA_FILE)
+    except Exception as e:
+        _LOG("写额度文件失败: %s" % e)
+
+
+def _qfill(item):
+    """补人可读字段，供面板/守护直接用。"""
+    it = dict(item)
+    ra = str(it.get("reset_at") or "")
+    if ra.isdigit():
+        it["reset_at_human"] = time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.localtime(int(ra)))
+    else:
+        it["reset_at_human"] = it.get("reset_at_human") or ra
+    try:
+        it["exhausted"] = bool(float(it.get("percent")) >= 100)
+    except Exception:
+        it["exhausted"] = bool(it.get("exhausted"))
+    return it
 
 
 def note_quota(model, quota):
     """从响应尾部的 usage.quota 记录配额，供面板展示与预警。
 
-    记下 uid 很关键：额度是按「账号×模型」算的，但 _QUOTA 的 key 只有 model，
-    换号之后同一个 key 上挂的还是上一个号的旧百分比。守护靠 uid 判断这条记录是不是当前号的，
-    否则会把旧号的 92% 当成新号的额度，刚切过去就又被判死。
+    记下 uid 很关键：额度是按「账号×模型」算的，key 必须带 uid，
+    否则换号之后同一个 key 上挂的还是上一个号的旧百分比，守护会把旧号的 92% 当成新号的额度，
+    刚切过去就又被判死。
     """
     if not isinstance(quota, dict) or not quota:
         return
-    key = model or quota.get("model") or ""
+    mname = quota.get("model") or model or ""
     try:
         uid = WM.current_uid() or ""
     except Exception:
         uid = ""
+    item = {
+        "model": mname,
+        "percent": quota.get("percent"),
+        "reset_at": quota.get("reset_at"),
+        "shared_models": quota.get("shared_models") or [],
+        "uid": uid,
+        "at": int(time.time()),
+    }
+    key = _qkey(uid, mname)
     with _QUOTA_LOCK:
-        _QUOTA[key] = {
-            "model": quota.get("model") or key,
-            "percent": quota.get("percent"),
-            "reset_at": quota.get("reset_at"),
-            "shared_models": quota.get("shared_models") or [],
-            "uid": uid,
-            "at": int(time.time()),
-        }
+        _QUOTA[key] = item
+        per = _qpersist_load()
+        per[key] = item
+        _qpersist_save()
+
+
+def note_quota_exhausted(model, reset_at="", message="", uid=None):
+    """上游明确回 6004/429：把这个「账号×模型」直接钉成已用 100%，并落盘。
+
+    这是「哪个号额度耗尽」最可靠的证据 —— 比任何探测都准，因为它就是上游的原话。
+    """
+    if uid is None:
+        try:
+            uid = WM.current_uid() or ""
+        except Exception:
+            uid = ""
+    mname = model or ""
+    item = {"model": mname, "percent": 100.0, "reset_at": reset_at or "",
+            "shared_models": [], "uid": uid, "at": int(time.time()),
+            "note": (message or "上游额度耗尽 6004")[:160]}
+    key = _qkey(uid, mname)
+    with _QUOTA_LOCK:
+        _QUOTA[key] = item
+        per = _qpersist_load()
+        per[key] = item
+        _qpersist_save()
+    _LOG("额度耗尽落账 %s @%s（重置 %s）" % (str(uid)[:12], mname, reset_at or "-"))
 
 
 def quota_snapshot():
@@ -294,52 +375,88 @@ def quota_snapshot():
     now = int(time.time())
     with _QUOTA_LOCK:
         for k, v in _QUOTA.items():
-            if now - v.get("at", 0) > QUOTA_TTL:
+            if now - int(v.get("at") or 0) > QUOTA_TTL:
                 continue
-            item = dict(v)
-            # reset_at 是秒级时间戳（字符串），顺手转人可读
-            ra = str(item.get("reset_at") or "")
-            if ra.isdigit():
-                item["reset_at_human"] = time.strftime(
-                    "%Y-%m-%d %H:%M:%S", time.localtime(int(ra)))
-            out[k] = item
+            out[k] = _qfill(v)
+    return out
+
+
+def quota_by_uid():
+    """uid -> {model: item}：内存实时值 + 落盘历史值合并，面板按账号逐行展示额度用。"""
+    out = {}
+    merged = {}
+    with _QUOTA_LOCK:
+        for k, v in _qpersist_load().items():
+            if isinstance(v, dict):
+                merged[k] = dict(v)
+        for k, v in _QUOTA.items():   # 内存值比落盘新，直接覆盖
+            merged[k] = dict(v)
+    for k, v in merged.items():
+        it = _qfill(v)
+        uid = it.get("uid") or (k.split("|")[0] if "|" in k else "")
+        mname = it.get("model") or (k.split("|")[1] if "|" in k else "")
+        if not uid or uid == "-":
+            continue
+        out.setdefault(uid, {})[mname or "-"] = it
     return out
 
 
 # ====================================================================== 熔断
 _COOLDOWN_LOCK = threading.Lock()
-_COOLDOWN = {}   # model -> {"until":ts,"reset_at":str,"msg":str,"code":str}
+_COOLDOWN = {}   # "uid|model" -> {"until":ts,"reset_at":str,"msg":str,"code":str}
 
 
-def cooldown_set(model, secs, reset_at="", msg="", code=""):
-    if not model or secs <= 0:
+def _ckey(model, uid=None):
+    """熔断键 = 账号 × 模型。
+
+    老版本只按 model 熔断：A 号撞了 6004 → 熔断 kimi-k3.1-pro → 换到满额的 B 号，
+    结果 B 号也被这条属于 A 号的熔断挡住，反代直接跳过它去换别的模型（就是那次上下文被换坏的起因）。
+    """
+    return ("%s|%s" % (uid, model)) if uid else (model or "")
+
+
+def cooldown_set(model, secs, reset_at="", msg="", code="", uid=None):
+    key = _ckey(model, uid)
+    if not key or secs <= 0:
         return
     with _COOLDOWN_LOCK:
-        _COOLDOWN[model] = {"until": time.time() + secs,
-                            "reset_at": reset_at or "", "msg": msg or "",
-                            "code": str(code or "")}
-    _LOG("熔断 %s：%.0fs 内不再打上游（%s）" % (model, secs, reset_at or msg[:40]))
+        _COOLDOWN[key] = {"until": time.time() + secs,
+                          "reset_at": reset_at or "", "msg": msg or "",
+                          "code": str(code or ""),
+                          "uid": uid or "", "model": model or ""}
+    _LOG("熔断 %s%s：%.0fs 内不再打上游（%s）"
+         % ((str(uid)[:8] + " @") if uid else "", model, secs, reset_at or (msg or "")[:40]))
 
 
-def cooldown_get(model):
+def cooldown_get(model, uid=None):
+    key = _ckey(model, uid)
     with _COOLDOWN_LOCK:
-        v = _COOLDOWN.get(model)
+        v = _COOLDOWN.get(key)
         if not v:
             return None
         if v["until"] <= time.time():
-            _COOLDOWN.pop(model, None)
+            _COOLDOWN.pop(key, None)
             return None
         item = dict(v)
         item["left"] = max(0, int(v["until"] - time.time()))
         return item
 
 
-def cooldown_clear(model=""):
+def cooldown_clear(model="", uid=None):
+    """清熔断：传 uid 只清这个号；不传 uid 清该模型在所有号上的熔断；都为空清全部。"""
     with _COOLDOWN_LOCK:
-        if model:
-            _COOLDOWN.pop(model, None)
-        else:
+        if not model and not uid:
             _COOLDOWN.clear()
+            return
+        if model and uid:
+            _COOLDOWN.pop(_ckey(model, uid), None)
+            return
+        if model:
+            for k in [k for k in _COOLDOWN if k == model or k.endswith("|" + model)]:
+                _COOLDOWN.pop(k, None)
+            return
+        for k in [k for k in _COOLDOWN if k.startswith(str(uid) + "|")]:
+            _COOLDOWN.pop(k, None)
 
 
 def cooldown_snapshot():

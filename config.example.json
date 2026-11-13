@@ -19,6 +19,9 @@
   "quota_switch_percent": 92,
   "quota_switch_min_secs": 900,
   "quota_warn_percent": 80,
+  "_comment_quota": "quota_sweep_secs=后台全号额度巡检间隔；switch_6004_min_secs=撞到 6004 后紧急换号的最小间隔（比主动换号宽松，因为已经真撞墙了）",
+  "quota_sweep_secs": 600,
+  "switch_6004_min_secs": 45,
   "audit_requests": 3,
   "_comment_slim": "输入瘦身：最近几条工具结果原样留，更早的超 slim_old_tool_chars 字符压成头尾保留；slim_tool_max_chars=0 表示不额外截断最近结果",
   "slim_enabled": true,
@@ -30,12 +33,9 @@
   "slim_old_tool_chars": 1500,
   "slim_keep_recent_tools": 3,
   "slim_tool_max_chars": 0,
+  "_comment_fallback": "0.5.2 起：额度类错误(429/6004)靠换账号解决，不再换模型（换模型等于把同一上下文丢给另一个模型，还会顺手烧掉同源备用号）。这份列表现在只在 404（模型名不存在）时按顺序降级，所以别堆太长",
   "fallback_models": [
     "kimi-k3.1-pro",
-    "kimi-k3-2",
-    "kimi-k3-1",
-    "deepseek-v4-pro",
-    "deepseek-v4.1-flash",
-    "glm-5.3"
+    "deepseek-v4-pro"
   ]
 }

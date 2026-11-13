@@ -17,6 +17,7 @@ workmom —— WorkBuddy 账号 / 模型 总控面板
 import json
 import os
 import queue
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -111,18 +112,75 @@ def load_usage():
     return out
 
 
-def load_relay():
+_RELAY_CACHE = {"at": 0.0, "data": {}}
+
+
+def load_relay(max_age=0.0):
+    """读反代 /relay_state。
+
+    max_age>0 表示「这么久以内已经读过就直接复用」——自动刷新每 5 秒一次，
+    每次都同步 HTTP 会卡住 Tk 主线程，表现出来就是点了刷新半天没反应。
+    """
+    now = time.time()
+    if max_age and (now - _RELAY_CACHE["at"]) <= max_age:
+        return _RELAY_CACHE["data"] or {}
+    data = {}
     try:
         req = urllib.request.Request(RELAY, headers={"Accept": "application/json"})
         op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with op.open(req, timeout=2) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
+        with op.open(req, timeout=1.2) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
-        return {}
+        data = {}
+    _RELAY_CACHE["at"] = now
+    _RELAY_CACHE["data"] = data if isinstance(data, dict) else {}
+    return _RELAY_CACHE["data"]
+
+
+PROBE_FILE = os.path.join(BASE, "data", "quota_probe_cache.json")
+
+
+def load_qprobe():
+    """守护进程探测其它号额度时落的缓存：{"uid|model": {percent, at, reset, note}}"""
+    d = read_json(PROBE_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def quota_of(uid, model, qby, probe, ttl=1800):
+    """某个账号在某模型上的「已用额度」百分比。
+
+    来源优先级：反代实测（最准，来自上游 usage.quota）> 守护探测缓存（2 小时内有效）。
+    返回 (percent|None, 来源说明, 重置时间文本, 是否已判死)。
+    """
+    item = None
+    if isinstance(qby, dict):
+        per = qby.get(uid)
+        if isinstance(per, dict):
+            item = per.get(model)
+    if isinstance(item, dict):
+        try:
+            if item.get("percent") is not None:
+                return (float(item.get("percent")), "实测",
+                        str(item.get("reset_at_human") or item.get("reset_at") or ""),
+                        bool(item.get("exhausted")))
+        except Exception:
+            pass
+        if item.get("exhausted"):
+            return 100.0, "实测", str(item.get("reset_at_human") or ""), True
+    hit = (probe or {}).get("%s|%s" % (uid, model))
+    if isinstance(hit, dict) and hit.get("percent") is not None:
+        try:
+            at = float(hit.get("at") or 0)
+            if time.time() - at <= ttl:
+                return (float(hit.get("percent")), "探测",
+                        str(hit.get("reset") or hit.get("reset_at") or ""),
+                        float(hit.get("percent")) >= 99.5)
+        except Exception:
+            pass
+    return None, "", "", False
 
 
 def port_alive(port=PORT):
-    import socket
     s = socket.socket()
     s.settimeout(0.6)
     try:
@@ -223,7 +281,7 @@ class App:
                           font=("Microsoft YaHei UI", 9), padx=pad, pady=3, cursor="hand2")
             return b
 
-        mkbtn(top, "立即刷新", self.refresh_all).pack(side="right")
+        mkbtn(top, "立即刷新", self.safe_refresh).pack(side="right")
         mkbtn(top, "重启 WB(兜底)", self.restart_wb_manual, YELLOW, 10).pack(side="right", padx=(0, 8))
 
         tk.Checkbutton(top, text="自动刷新(5s)", variable=self.auto, bg=BG, fg=MUTED,
@@ -254,6 +312,7 @@ class App:
         stat.pack(fill="x", padx=16, pady=(0, 10))
         self.stat_labels = {}
         for key, text in [("total", "总余额"), ("ok", "可用账号"), ("limited", "限流中"),
+                          ("exhausted", "额度耗尽"), ("quota", "当前号额度"),
                           ("usage", "累计消耗 credits"), ("req", "总请求数"),
                           ("claim", "今日签到"), ("relay", "反代")]:
             box = tk.Frame(stat, bg=PANEL)
@@ -271,12 +330,13 @@ class App:
 
         wrap1 = tk.Frame(root, bg=BG)
         wrap1.pack(fill="both", expand=True, padx=16)
-        cols1 = ("name", "credits", "used", "req", "models", "flow", "state", "left",
-                 "checkin", "expire", "checked")
+        cols1 = ("name", "credits", "used", "req", "models", "flow", "state", "quota",
+                 "left", "checkin", "expire", "checked")
         heads1 = ("账号", "余额 credits", "累计消耗", "请求数", "用过模型", "占比", "pro 状态",
-                  "限流倒计时", "今日签到", "凭证到期", "上次检测")
-        widths1 = (128, 108, 92, 66, 74, 60, 84, 100, 78, 92, 78)
-        anchors1 = ("w", "e", "e", "e", "center", "e", "center", "center", "center", "center", "center")
+                  "额度已用", "限流倒计时", "今日签到", "凭证到期", "上次检测")
+        widths1 = (128, 108, 92, 66, 74, 60, 84, 92, 100, 78, 92, 78)
+        anchors1 = ("w", "e", "e", "e", "center", "e", "center", "center", "center",
+                    "center", "center", "center")
         self.t1 = ttk.Treeview(wrap1, columns=cols1, show="headings", height=8)
         for c, h, w, a in zip(cols1, heads1, widths1, anchors1):
             self.t1.heading(c, text=h)
@@ -329,19 +389,49 @@ class App:
         self.root.after(2500, self._auto_claim_once)
 
     # ------------------------------------------------------------------ 刷新
+    def safe_refresh(self):
+        """刷新兜底：任何一次异常都不许把界面刷新链打断（断了就是"点了没反应"）。"""
+        try:
+            self.refresh_all()
+            return True
+        except Exception as e:
+            import traceback
+            msg = "%s: %s" % (type(e).__name__, e)
+            try:
+                self.set_bar("刷新失败（已写 logs/panel_error.log）：%s" % msg[:110], RED)
+            except Exception:
+                pass
+            try:
+                p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "logs", "panel_error.log")
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write("[%s] 刷新异常\n%s\n" %
+                            (time.strftime("%Y-%m-%d %H:%M:%S"), traceback.format_exc()))
+            except Exception:
+                pass
+            return False
+
     def refresh_all(self):
+        t0 = time.time()
         sync_accounts()
         credits = load_credits()
         usage = load_usage()
         ledger = read_json(LEDGER, {})
-        relay = load_relay()
+        relay = load_relay(max_age=1.0)
         cur_uid = WM.current_uid()
         cur_model = WM.active_model()
+        qby = (relay or {}).get("quotas_by_uid") or (relay or {}).get("quotas") or {}
+        probe = load_qprobe()
+        try:
+            th = float((relay or {}).get("quota_switch_percent")
+                       or WM.cfg().get("quota_switch_percent") or 92)
+        except Exception:
+            th = 92.0
 
         self.t1.delete(*self.t1.get_children())
         self.rowmap = {}
         total_credits = 0.0
-        n_ok = n_lim = 0
+        n_ok = n_lim = n_exh = 0
         n_claimed = 0
 
         rows = []
@@ -359,26 +449,49 @@ class App:
                 n_claimed += 1
             if cr:
                 total_credits += cr
+            # 额度：反代实测优先（它每次成功响应都会记下上游 usage.quota），
+            # 没实测过就看守护探测缓存（带 * 号标记，最多 2 小时有效）。
+            pct, qsrc, qreset, qdead = quota_of(uid, cur_model, qby, probe)
+            q_txt = "—"
+            if pct is not None:
+                if pct >= 99.5:
+                    q_txt = "%.0f%% 满" % pct
+                elif pct >= th:
+                    q_txt = "%.0f%% 接近" % pct
+                else:
+                    q_txt = "%.0f%%" % pct
+                if qsrc == "探测":
+                    q_txt += "*"
+                if pct >= 99.5:
+                    qdead = True
+            qtip = qreset or ""
             if status == "ok":
-                n_ok += 1
                 st_txt = "可用"
             elif status == "limited":
                 if clear_at and clear_at <= time.time():
                     st_txt = "待复测"
                 else:
-                    n_lim += 1
                     st_txt = "限流中"
             else:
                 st_txt = "未测"
+            if qdead and st_txt != "限流中":
+                st_txt = "额度耗尽"   # 额度打满比"可用"更该被看见
+            if st_txt == "可用":
+                n_ok += 1
+            elif st_txt == "限流中":
+                n_lim += 1
+            elif st_txt == "额度耗尽":
+                n_exh += 1
             rows.append((u["total"], uid, name, cr, u, st_txt, clear_at,
-                         checked_txt, status, ck))
+                         checked_txt, status, ck, q_txt, qtip))
 
         rows.sort(key=lambda x: -x[0])
-        for total, uid, name, cr, u, st_txt, clear_at, checked_txt, status, ck in rows:
+        for (total, uid, name, cr, u, st_txt, clear_at, checked_txt, status, ck,
+             q_txt, qtip) in rows:
             share = ""
             if cr and cr > 0:
                 share = "%.0f%%" % (total / (total + cr) * 100) if (total + cr) else ""
-            tag = "limited" if st_txt == "限流中" else ("ok" if st_txt == "可用" else "")
+            tag = "limited" if st_txt in ("限流中", "额度耗尽") else ("ok" if st_txt == "可用" else "")
             tags = [tag]
             if uid == cur_uid:
                 tags.append("now")
@@ -387,6 +500,7 @@ class App:
                 name, fmt_credits(cr), fmt_credits(total) if total else "0.00",
                 u["count"] if u["count"] else "未用过",
                 ("%d 个" % len(u["models"])) if u["models"] else "未用过", share, st_txt,
+                q_txt,
                 fmt_left(clear_at) if st_txt == "限流中" else "—",
                 ck.get("text") or "-",
                 fmt_exp(WM.account_summary(uid).get("expiresAt")),
@@ -427,6 +541,14 @@ class App:
         self.stat_labels["total"].config(text=fmt_credits(total_credits))
         self.stat_labels["ok"].config(text="%d / %d" % (n_ok, len(ACCOUNTS)), fg=GREEN)
         self.stat_labels["limited"].config(text="%d 个" % n_lim, fg=RED if n_lim else MUTED)
+        self.stat_labels["exhausted"].config(text="%d 个" % n_exh, fg=RED if n_exh else MUTED)
+        cur_pct, cur_src, cur_reset, cur_dead = quota_of(cur_uid, cur_model, qby, probe)
+        if cur_pct is None:
+            self.stat_labels["quota"].config(text="—", fg=MUTED)
+        else:
+            self.stat_labels["quota"].config(
+                text="%.0f%%" % cur_pct,
+                fg=RED if cur_pct >= 99.5 else (YELLOW if cur_pct >= th else GREEN))
         self.stat_labels["usage"].config(text=fmt_credits(grand_used))
         self.stat_labels["req"].config(text=str(grand_req))
         self.stat_labels["claim"].config(
@@ -436,7 +558,11 @@ class App:
         if cur_uid:
             nm = NAME.get(cur_uid) or WM.current_account().get("nickname") or cur_uid[:8]
             self.stat_labels["relay"].config(text="运行中", fg=GREEN if port_alive() else RED)
-            self.lbl_now.config(text="在用账号：%s" % nm, fg=GREEN)
+            qt = ""
+            if cur_pct is not None:
+                qt = "，额度已用 %.0f%%%s" % (cur_pct, ("（%s 重置）" % cur_reset) if cur_reset else "")
+            self.lbl_now.config(text="在用账号：%s%s" % (nm, qt),
+                                fg=RED if (cur_pct is not None and cur_pct >= 99.5) else GREEN)
         else:
             self.stat_labels["relay"].config(text="未运行", fg=RED)
             self.lbl_now.config(text="没读到登录态", fg=RED)
@@ -686,7 +812,7 @@ class App:
                 self.lbl_hint.config(text="双击账号行=无感切号　双击模型行=切模型（两者互不影响）")
             except Exception:
                 pass
-            self.refresh_all()
+            self.safe_refresh()
 
     def _toggle_top(self):
         try:
@@ -696,24 +822,39 @@ class App:
 
     def tick(self):
         """每秒刷新倒计时，5 秒重载一次数据；顺带把后台线程进度搬到界面"""
+        try:
+            self._tick_body()
+        except Exception:
+            pass
+        finally:
+            # after 必须无条件续命：以前任何一次异常都会让这条链断掉，
+            # 表现就是「点刷新没反应、界面冻在几十分钟前的样子」。
+            self.root.after(1000, self.tick)
+
+    def _tick_body(self):
         self._drain_msgs()
         ledger = self.cache.get("ledger") or {}
-        for iid in self.t1.get_children():
-            uid = (getattr(self, "rowmap", {}) or {}).get(iid)
-            if not uid:
-                continue
-            v = list(self.t1.item(iid, "values"))
-            if len(v) > 7 and v[6] == "限流中" and v[7] not in ("—", "已解禁"):
-                clear_at = (ledger.get(uid) or {}).get("clear_at") or 0
-                left = fmt_left(clear_at)
-                if left != v[7]:
-                    v[7] = left
-                    self.t1.item(iid, values=v)
+        cols = list(self.t1["columns"])
+        i_state = cols.index("state") if "state" in cols else -1
+        i_left = cols.index("left") if "left" in cols else -1
+        if i_state >= 0 and i_left >= 0:
+            for iid in self.t1.get_children():
+                uid = (getattr(self, "rowmap", {}) or {}).get(iid)
+                if not uid:
+                    continue
+                v = list(self.t1.item(iid, "values"))
+                if len(v) <= i_left:
+                    continue
+                if v[i_state] == "限流中" and v[i_left] not in ("—", "已解禁"):
+                    clear_at = (ledger.get(uid) or {}).get("clear_at") or 0
+                    left = fmt_left(clear_at)
+                    if left != v[i_left]:
+                        v[i_left] = left
+                        self.t1.item(iid, values=v)
         if self.auto.get():
             self._cnt = getattr(self, "_cnt", 0) + 1
             if self._cnt % 5 == 0:
-                self.refresh_all()
-        self.root.after(1000, self.tick)
+                self.safe_refresh()
 
 
 def main():

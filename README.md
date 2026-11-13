@@ -227,6 +227,8 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 | `quota_switch_percent` | `92` | 已用额度到多少就主动换号（`92` = 用掉 92% 才换；想早点换就调小，如 `80`） |
 | `quota_switch_min_secs` | `900` | 两次主动换号的最小间隔（秒），防多号同窗限流原地打转 |
 | `quota_warn_percent` | `80` | 用量过这个比例在 `/health` 与面板上标黄预警 |
+| `quota_sweep_secs` | `600` | 全号额度巡检间隔（0.5.2）：每隔这么久把所有账号的额度都探一遍写进 `/relay_state` |
+| `switch_6004_min_secs` | `45` | 撞到 6004 后紧急换号的最小间隔（0.5.2）：已真撞墙，比主动换号宽松得多 |
 | `audit_requests` | `3` | 请求审计保留最近几条完整请求体，`0` 关闭（落 `logs/req_audit.jsonl`） |
 | `slim_enabled` | `true` | 输入瘦身总开关（0.5.1，见下节） |
 | `slim_keep_recent_tools` | `3` | 最近 N 条工具结果原样保留，更早的按 `slim_old_tool_chars` 压缩 |
@@ -245,10 +247,13 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
   0.5.0 起再加 `transport` / `transport_ready` / `max_concurrency` / `direct` / `cdp_health` /
   `cooldowns` / `usage` / `auto_heal` / `fallback_models`；
   0.5.1 起再加 `quotas`（各号各模型用量）/ `quota_switch_percent` / `quota_warn_percent` /
-  `audit_left`（审计还留几条）/ `slim`（瘦身开关与累计节省）
+  `audit_left`（审计还留几条）/ `slim`（瘦身开关与累计节省）；
+  0.5.2 起 `quotas` 的完整明细也进了 `/relay_state`（见下条），`/health` 另带 `last_pro_6004_uid`
 - `GET /` `GET /panel` —— **Web 面板**（浏览器直接看，不用开 Tkinter）：通道健康、CDP 探活、限流冷却倒计时、
   用量账本、近期错误表，10 秒自动刷新
-- `GET /relay_state` —— 运行状态（守护只读消费，零额外 token）
+- `GET /relay_state` —— 运行状态（守护只读消费，零额外 token）。0.5.2 起带全账号额度明细：
+  `uid`（当前有效号）/ `quotas_by_uid`（`{uid: {model: {percent, reset_at, at}}}`，面板靠它逐行显示「额度已用」）/
+  `last_pro_6004_uid`（最近一次撞 6004 的是哪个号）
 - `GET /v1/models` —— OpenAI 格式模型列表
 - `POST /v1/chat/completions` —— OpenAI Chat 协议，`model` 字段留空则用当前模型
 - `POST /v1/messages` —— Anthropic Messages 协议（Claude Code 等）
@@ -285,7 +290,10 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 ```
 
 响应头另带 `Retry-After`（秒）与 `X-WM-Quota-Exceeded: 1`。
-同时反代按 `fallback_models` 顺序**自动降级**到下一个没用满的模型继续出字，只有全都被限才真的报 429。
+**0.5.2 改了策略：额度类错误（429/6004）不再换模型顶。** 额度是账号维度的，换模型等于把同一条上下文丢给
+另一个模型（上下文被来回搅坏），同源备用模型还会被顺手烧掉。现在 429 原样透传给客户端 —— 看到 429 说明
+**该换账号**了，守护会在 `switch_6004_min_secs`（默认 45 秒）内完成无感切号，客户端重试即可。
+只有 404（模型名写错/不存在）才会在同一账号内按 `fallback_models` 顺序降级。
 
 ### 输入瘦身 slim（0.5.1 起）
 
@@ -328,6 +336,26 @@ python workmom_guard.py --quota-check
 
 会逐条打印阈值、当前用量、距上次换号多久、有没有更干净的号，最后给一句结论。加 `--probe` 会实打一次上游拿真实额度（那一次会计费）。
 
+### 额度可见 + 撞墙只换号不换模型（0.5.2 起）
+
+三个坑一次填掉：
+
+**1. 额度摊到面板上，不再只有当前号一个数字。**
+`/relay_state` 增加 `quotas_by_uid`（全账号全模型明细）、`uid`、`last_pro_6004_uid`；
+守护按 `quota_sweep_secs`（默认 600 秒）做**全号巡检**。面板新增「额度已用」列：
+`84%` 正常 / 黄色预警 / ≥99.5% 红；没探到数据就显示 `—`，不会留空行。
+
+**2. 撞 6004 只换账号，绝不换模型。**
+`server.py` 里 429/6004 不再走 `fallback_models` 降级（那会把同一条上下文丢给另一个模型，还会把
+`kimi-k3-1` / `kimi-k3-2` 这类同源备用号一起烧掉），改为原样透传 429 + 打 `quota` 熔断标记；
+守护看到后走紧急换号通道（`switch_6004_min_secs`，默认 45 秒），额度到 **100%** 更是立即切、不等冷却。
+切号后旧号的额度读数一律作废（`quota_stale_since`），不会拿过期数字判断新号。
+
+**3. 面板刷新不再一断就死。**
+以前定时刷新把数据直接往 `Listbox` 里铺，列定义与数据长度必须严格相等 —— 加了「额度已用」列的这一版
+一开始就是「刷新一下就不动」的状态。现在统一走 `safe_refresh()`，`_tick_body()` 把取数、格式化、渲染分段隔离，
+任何一列缺失按 `—` 补位，异常写 `logs/panel_error.log` 后继续排下一次刷新，不用重开面板。
+
 ## 七、排障
 
 | 现象 | 先看哪 |
@@ -340,6 +368,8 @@ python workmom_guard.py --quota-check
 | `setup.bat` 说 CDP 不通、自检失败 | 按它打印的手动命令带 `--remote-debugging-port=9226` 重启 WorkBuddy，再跑一次 `setup.bat` |
 | 反代没起来 / `端口监听 False` | `logs/relay.out.log`、`logs/relay.err.log`；多半是端口被旧进程占着，跑 `stop_all.bat` 再起 |
 | 切号没反应 | `logs/workmom.log` 里找「无感切号完成」；失败时看是不是 CDP 9226 不通（WorkBuddy 没带 `--remote-debugging-port=9226` 启动） |
+| 面板「额度已用」列一直显示 `—` | 守护还没跑过一轮额度巡检（等 `quota_sweep_secs`，默认 10 分钟），或探测被上游拒。手动触发一次：`python workmom_guard.py --quota-check`（零副作用）或加 `--probe` 实打一次；看 `logs/workmom.log` 里有没有「全号额度」相关行 |
+| 面板刷新一下就不动了 / 按钮全失灵 | 0.5.2 已修（列数与数据长度不等导致 `_tick` 抛异常中断）。若仍出现：看 `logs/panel_error.log` 最新一行；确认跑的是新进程，`stop_all.bat` 后重起 |
 | 每轮输入 token 都很大，像历史被重发了一整遍 | 先确认瘦身是开着的：`curl -s http://127.0.0.1:18793/health` 看 `slim.enabled` 与 `slim.requests` 有没有在涨；再看响应头 `X-WM-Slim-Pct`（省了多少百分比）。如果 `saved_est_total` 一直是 0，多半是 `config.json` 里 `slim_enabled=false` 或进程没重启 |
 | 想确认「额度主动换号」到底判没判、为什么没换 | 跑 `python workmom_guard.py --quota-check`（零副作用，绝不切号）。它会逐条打印：阈值多少、当前号该模型已用多少、距上次换号多久、号池里有没有更干净的号，最后一句结论。四条件缺哪条一目了然 |
 | 领积分说"已签到" | 正常，`data/checkin.json` 里已有当天记录，别重复请求 |
