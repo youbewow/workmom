@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 WorkBuddy 账号自动轮换守护进程（配合 wb-k3relay 反代）
@@ -28,6 +28,7 @@ WorkBuddy 账号自动轮换守护进程（配合 wb-k3relay 反代）
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -80,6 +81,10 @@ DEF = {
     "cooldown": 120,           # 两次切号之间最小间隔（秒）
     "backoff": 900,            # 整队全爆后的退避时间（秒）
     "switch_cooldown": 0,      # 单个号被判定失败的记忆时长（秒），0=不记忆
+    # 额度阈值主动换号：当前号该模型用量百分比 >= 阈值就换，不等撞 6004
+    # 0 = 关闭（退回老逻辑：只有真限流了才换）
+    "quota_switch_percent": 92,
+    "quota_switch_min_secs": 900,   # 两次「额度换号」最小间隔，防抖
 }
 
 LOG_FILE = os.path.join(LOGDIR, "workmom_guard.log")
@@ -665,6 +670,185 @@ def switch_next(cfg, st, reason="6004", dry=False):
     return False
 
 
+def current_quota(cfg, rs, stale_since=0):
+    """从 /relay_state 的 quotas 里取「当前账号 + 当前模型」的额度百分比。
+
+    返回 (percent|None, model, reset_human)。
+    quotas 是反代从上游响应尾部 usage.quota 顺手记下来的，读它零 token 成本。
+    两层过滤，缺一不可：
+      1) uid 不符 → 是换号前那个号的旧记录，直接丢（额度按账号×模型算，key 只有 model）；
+      2) at 早于 stale_since → 本轮换号之后还没收到过新响应，不能拿旧数字判死刑。
+    """
+    q = (rs or {}).get("quotas") or {}
+    if not isinstance(q, dict) or not q:
+        return None, "", ""
+    want = (rs or {}).get("model") or ""
+    cur_uid = (rs or {}).get("uid") or ""
+    cands = [v for v in q.values() if isinstance(v, dict) and v.get("percent") is not None]
+    if not cands:
+        return None, "", ""
+    item = q.get(want) if want else None
+    if not isinstance(item, dict) or item.get("percent") is None:
+        item = max(cands, key=lambda v: v.get("at") or 0)
+    if not isinstance(item, dict) or item.get("percent") is None:
+        return None, want, ""
+    m = item.get("model") or want
+    iuid = item.get("uid") or ""
+    if cur_uid and iuid and iuid != cur_uid:
+        return None, m, _reset_text(item)
+    if (item.get("at") or 0) <= (stale_since or 0):
+        return None, m, _reset_text(item)
+    try:
+        pct = float(item.get("percent"))
+    except Exception:
+        return None, m, _reset_text(item)
+    return pct, m, _reset_text(item)
+
+
+def _reset_text(item):
+    return str(item.get("reset_at_human") or item.get("reset_at") or "")
+
+
+# --------------------------------------------------------------- 候选号额度探测
+# 队列里其他号现在还剩多少额度，反代不知道（quota 只记当前号）。不探测就只能"盲切"，
+# 可能切到另一个也满的号，白折腾一轮还把 6004 撞出来。
+# 探测方式：拿该号自己的 token 直连发一条 max_tokens=1 的请求，读回 usage.quota。
+# 每个号的结果缓存 PROBE_TTL 秒，避免每次轮询都烧请求。
+PROBE_TTL = 1800
+DATADIR = os.path.join(BASE, "data")
+QPROBE_FILE = os.path.join(DATADIR, "quota_probe_cache.json")
+
+
+def _qprobe_load():
+    try:
+        with open(QPROBE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _qprobe_save(d):
+    try:
+        os.makedirs(DATADIR, exist_ok=True)
+        tmp = QPROBE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, QPROBE_FILE)
+    except Exception as e:
+        log("写额度探测缓存失败: %s" % e)
+
+
+def probe_quota(cfg, uid, model, ttl=PROBE_TTL, dry=False):
+    """探测某个账号在某模型上的已用额度百分比。返回 (pct|None, reset_str, note)。
+
+    pct=100.0 且 note 含 6004 表示该号已经撞墙——这本身就是最可靠的"满额"证据。
+    dry=True 只读缓存不发请求。
+    """
+    if not uid or not model:
+        return None, "", "参数缺失"
+    cache = _qprobe_load()
+    key = "%s|%s" % (uid, model)
+    hit = cache.get(key)
+    now = int(time.time())
+    if isinstance(hit, dict) and now - int(hit.get("at") or 0) <= ttl:
+        return hit.get("percent"), hit.get("reset_at") or "", "缓存"
+    if dry:
+        return None, "", "无缓存(dry)"
+
+    token = ""
+    try:
+        r = WM.ensure_fresh_token(uid)
+        if isinstance(r, (tuple, list)):
+            for x in r:
+                if isinstance(x, str) and len(x) > 100:
+                    token = x
+                    break
+        elif isinstance(r, str):
+            token = r
+    except Exception as e:
+        return None, "", "取凭证失败: %s" % str(e)[:80]
+    if not token or len(token) < 100:
+        return None, "", "取不到凭证"
+
+    host = (cfg.get("api_host") or "https://www.workbuddy.cn").rstrip("/")
+    body = json.dumps({"model": model,
+                       "messages": [{"role": "user", "content": "hi"}],
+                       "max_tokens": 1, "stream": False},
+                      ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        host + "/v2/chat/completions", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + token,
+                 "User-Agent": "Mozilla/5.0 workmom-guard",
+                 "Accept": "application/json",
+                 "Accept-Encoding": "identity"})
+    pct, reset_at, note = None, "", ""
+    try:
+        with _OPENER.open(req, timeout=40) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        data = json.loads(raw) if raw.strip().startswith("{") else {}
+        quota = (data.get("usage") or {}).get("quota") or {}
+        if quota.get("percent") is not None:
+            pct = float(quota["percent"])
+            ra = str(quota.get("reset_at") or "")
+            reset_at = (time.strftime("%m-%d %H:%M", time.localtime(int(ra)))
+                        if ra.isdigit() else ra)
+        note = "直连探测"
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read().decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        if e.code == 429 or "6004" in raw:
+            pct, reset_at, note = 100.0, "", "429/6004 已满"
+            m = re.search(r'"?reset[^"]*"?\s*[:=]\s*"?([^",}]+)', raw)
+            if m:
+                reset_at = m.group(1)[:40]
+        else:
+            note = "HTTP %s: %s" % (e.code, raw[:80])
+    except Exception as e:
+        note = "探测异常: %s" % str(e)[:80]
+
+    if pct is not None or note in ("429/6004 已满",):
+        cache[key] = {"percent": pct, "reset_at": reset_at,
+                      "at": now, "note": note}
+        _qprobe_save(cache)
+        log("探测额度 %s @%s = %s（%s）" % (uid[:12], model,
+                                          "满" if pct == 100.0 else "%s%%" % pct if pct is not None else "?",
+                                          note))
+    return pct, reset_at, note
+
+
+def _all_quota_low(cfg, rs, th, st):
+    """判断队列里是不是已经没有比阈值更干净的号了。
+
+    返回 True = 没有更干净的号，别切（切了也是撞墙，还会把 6004 引出来、把别的号也染上冷却）。
+    返回 False = 有干净号，可以切。
+    探测不到的号按"未知"处理，当作可以切——交给 6004 兜底，总比一动不动强。
+    """
+    model = (rs or {}).get("model") or st.get("model") or ""
+    cur = (rs or {}).get("uid") or st.get("current_uid") or ""
+    q = cfg.get("queue") or _load_queue(cfg)
+    cands = [u for u in q if u != cur]
+    if not cands:
+        return True
+    tried = 0
+    for uid in cands:
+        if tried >= 3:
+            break
+        tried += 1
+        pct, _rst, note = probe_quota(cfg, uid, model)
+        if pct is None:
+            log("候选号 %s 额度未知（%s），允许切换，交给 6004 兜底" % (uid[:12], note))
+            return False
+        if pct < th:
+            log("候选号 %s 额度 %.1f%% < 阈值 %.0f%%，可以切" % (uid[:12], pct, th))
+            return False
+        log("候选号 %s 额度 %.1f%% 也偏高，跳过" % (uid[:12], pct))
+    return True
+
+
 def sync_current_uid(cfg, st):
     """从反代 /relay_state 或 auth 文件同步当前账号，避免切号目标算错。"""
     rs = relay_state(cfg)
@@ -698,6 +882,27 @@ def do_status(cfg, st):
             print("   最近错误    :", le.get("model"), "status=", le.get("status"),
                   "6004=", le.get("code6004"))
             print("                 ", (le.get("body") or le.get("detail") or "")[:160])
+        # 额度视图：当前号的百分比来自反代顺手记的 quota；其他号来自探测缓存（可能没有）
+        th = float(cfg.get("quota_switch_percent") or 0)
+        pct, qmodel, qreset = current_quota(cfg, rs)
+        print("额度阈值      :", ("%.0f%%（超过就主动换号）" % th) if th > 0 else "已关闭")
+        if pct is None:
+            print("   当前号额度  : 未知（本进程还没发过带 quota 的请求）")
+        else:
+            flag = "  ← 已超阈值" if th > 0 and pct >= th else ""
+            print("   当前号额度  : %s 已用 %.1f%%%s%s" % (
+                qmodel or "-", pct, ("，%s 重置" % qreset) if qreset else "", flag))
+        cache = _qprobe_load()
+        cur_uid = rs.get("uid") if rs else st.get("current_uid")
+        mine = {k: v for k, v in cache.items() if not k.startswith("%s|" % (cur_uid or "@@"))}
+        if mine:
+            print("   其他号探测  :")
+            now = int(time.time())
+            for k, v in list(mine.items())[:8]:
+                uid, _, mid = k.partition("|")
+                age = int(now - int(v.get("at") or 0))
+                print("      %-14s %-18s %s%%   %ds前  %s" % (
+                    uid[:12], mid, v.get("percent"), age, v.get("note") or ""))
     print("守护状态      :", STATE_FILE)
     print("   当前记录账号:", st.get("current_uid") or "-")
     print("   上次切号    :", time.strftime("%m-%d %H:%M:%S", time.localtime(st["last_switch_at"]))
@@ -705,6 +910,66 @@ def do_status(cfg, st):
     print("   退避到      :", time.strftime("%m-%d %H:%M:%S", time.localtime(st["backoff_until"]))
           if st.get("backoff_until") else "-")
     print("=" * 60)
+
+
+def do_quota_check(cfg, st, probe=False):
+    """零副作用自检：把 B 规则（额度阈值主动换号）的每个判断环节打印出来，绝不切号。"""
+    rs = relay_state(cfg)
+    print("=" * 60)
+    print("【B 规则自检】额度阈值主动换号 —— 只判断，不执行")
+    if not rs:
+        print("反代 /relay_state 不可达，无法判断")
+        return 1
+    try:
+        th = float(cfg.get("quota_switch_percent") or 0)
+    except Exception:
+        th = 0.0
+    try:
+        min_gap = float(cfg.get("quota_switch_min_secs") or 900)
+    except Exception:
+        min_gap = 900.0
+    print("1) 阈值        :", ("%.0f%%" % th) if th > 0 else "已关闭（quota_switch_percent=0）")
+    print("   换号最小间隔:", "%.0fs" % min_gap)
+    pct, qmodel, qreset = current_quota(cfg, rs, st.get("quota_stale_since") or 0)
+    print("2) 当前号      :", (rs.get("uid") or "?")[:12], "| 模型:", qmodel or rs.get("model") or "?")
+    print("   已用额度    :", ("%.1f%%（%s 重置）" % (pct, qreset or "-")) if pct is not None else "未知")
+    if th <= 0:
+        print("→ 结论：阈值功能关闭，永不主动换号（仍保留 6004 兜底切号）")
+        return 0
+    if pct is None:
+        print("→ 结论：额度未知，不主动换号（等反代下一次成功请求把 quota 记下来）")
+        return 0
+    if pct < th:
+        print("→ 结论：额度 %.1f%% < 阈值 %.0f%%，保持当前号" % (pct, th))
+        return 0
+    print("3) 已达阈值，逐项检查是否允许切换：")
+    last_at = st.get("last_quota_switch_at") or 0
+    since = (time.time() - last_at) if last_at else 10 ** 9
+    print("   距上次额度换号: %s（需 %.0fs）%s" % (
+        "从未换过" if not last_at else "%.0fs" % since, min_gap,
+        "✓" if since >= min_gap else "✗ 冷却中"))
+    backoff_ok = time.time() > (st.get("backoff_until") or 0)
+    left = int((st.get("backoff_until") or 0) - time.time())
+    print("   整队退避期    : %s" % ("无 ✓" if backoff_ok else "剩 %ds ✗" % left))
+    if probe:
+        low = _all_quota_low(cfg, rs, th, st)
+        print("   队列是否有更干净号:", "无（探测过前3个）✗" if low else "有 ✓")
+    else:
+        low = None
+        cache = _qprobe_load()
+        print("   队列探测      : 未开启（加 --probe 真探测前面几个号的额度，会各消耗 1 token）")
+        for k, v in list(cache.items())[:5]:
+            print("      %s → %s%%  %ds前" % (k.replace("|", " | "), v.get("percent"),
+                                            int(time.time() - int(v.get("at") or 0))))
+    if since < min_gap:
+        print("→ 结论：冷却中，暂不换号")
+    elif not backoff_ok:
+        print("→ 结论：整队退避中，暂不换号")
+    elif low:
+        print("→ 结论：别的号也不干净，不换（避免原地打转），等 6004 兜底")
+    else:
+        print("→ 结论：条件全部满足，下一轮轮询会主动换到下一个干净号")
+    return 0
 
 
 def main():
@@ -717,6 +982,9 @@ def main():
     if "--status" in args:
         do_status(cfg, st)
         return 0
+
+    if "--quota-check" in args:
+        return do_quota_check(cfg, st, probe="--probe" in args)
 
     dry = "--dry-run" in args
 
@@ -793,6 +1061,39 @@ def main():
                     handled = hit_at
                     st["handled_6004_at"] = handled
                     save_state(st)
+
+            # 4) 额度阈值主动换号（B 规则）
+            #    不再等撞 6004 —— 撞墙那一次请求本身已经废了，而且撞完才知道墙在哪。
+            #    改为读反代从上游 usage.quota 顺手记下的百分比，超过阈值就提前换到下一个干净号。
+            if rs:
+                try:
+                    th = float(cfg.get("quota_switch_percent") or 0)
+                except Exception:
+                    th = 0.0
+                try:
+                    min_gap = float(cfg.get("quota_switch_min_secs") or 900)
+                except Exception:
+                    min_gap = 900.0
+                pct, qmodel, qreset = current_quota(cfg, rs, st.get("quota_stale_since") or 0)
+                if th > 0 and pct is not None and pct >= th:
+                    since = time.time() - (st.get("last_quota_switch_at") or 0)
+                    backoff_ok = time.time() > (st.get("backoff_until") or 0)
+                    if since < min_gap:
+                        log("额度 %.1f%% 超阈值 %.0f%%，但距上次额度换号仅 %.0fs（需 %.0fs），暂不动"
+                            % (pct, th, since, min_gap))
+                    elif not backoff_ok:
+                        left = int((st.get("backoff_until") or 0) - time.time())
+                        log("额度 %.1f%% 超阈值，但整队在退避期（剩 %ds），暂不动" % (pct, left))
+                    elif _all_quota_low(cfg, rs, th, st):
+                        log("额度 %.1f%% 超阈值，但队列里没有更干净的号，保守不动（等 6004 兜底）" % pct)
+                    else:
+                        log("额度预警：当前号 %s 已用 %.1f%% >= 阈值 %.0f%%（%s 重置），主动换下一个号"
+                            % (qmodel or "?", pct, th, qreset or "-"))
+                        st["last_quota_switch_at"] = time.time()
+                        save_state(st)
+                        switch_next(cfg, st, reason="quota_%.0f%%" % pct, dry=dry)
+                        if "--once" in args:
+                            break
 
             if "--once" in args:
                 break

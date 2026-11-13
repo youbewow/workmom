@@ -265,16 +265,26 @@ _QUOTA = {}   # model -> {"percent":..,"reset_at":..,"at":ts,"raw":..}
 
 
 def note_quota(model, quota):
-    """从响应尾部的 usage.quota 记录配额，供面板展示与预警。"""
+    """从响应尾部的 usage.quota 记录配额，供面板展示与预警。
+
+    记下 uid 很关键：额度是按「账号×模型」算的，但 _QUOTA 的 key 只有 model，
+    换号之后同一个 key 上挂的还是上一个号的旧百分比。守护靠 uid 判断这条记录是不是当前号的，
+    否则会把旧号的 92% 当成新号的额度，刚切过去就又被判死。
+    """
     if not isinstance(quota, dict) or not quota:
         return
     key = model or quota.get("model") or ""
+    try:
+        uid = WM.current_uid() or ""
+    except Exception:
+        uid = ""
     with _QUOTA_LOCK:
         _QUOTA[key] = {
             "model": quota.get("model") or key,
             "percent": quota.get("percent"),
             "reset_at": quota.get("reset_at"),
             "shared_models": quota.get("shared_models") or [],
+            "uid": uid,
             "at": int(time.time()),
         }
 

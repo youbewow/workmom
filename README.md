@@ -224,6 +224,17 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 | `fallback_models` | pro → k3-2 → k3-1 → deepseek → glm | 上游 6004 / 429 时的自动降级顺序 |
 | `auto_heal` | `report` | 看门狗：`off` 关闭 / `report` 只上报 / `restart` 自动重启 WorkBuddy |
 | `heal_interval_sec` | `60` | 看门狗探活间隔 |
+| `quota_switch_percent` | `92` | 已用额度到多少就主动换号（`92` = 用掉 92% 才换；想早点换就调小，如 `80`） |
+| `quota_switch_min_secs` | `900` | 两次主动换号的最小间隔（秒），防多号同窗限流原地打转 |
+| `quota_warn_percent` | `80` | 用量过这个比例在 `/health` 与面板上标黄预警 |
+| `audit_requests` | `3` | 请求审计保留最近几条完整请求体，`0` 关闭（落 `logs/req_audit.jsonl`） |
+| `slim_enabled` | `true` | 输入瘦身总开关（0.5.1，见下节） |
+| `slim_keep_recent_tools` | `3` | 最近 N 条工具结果原样保留，更早的按 `slim_old_tool_chars` 压缩 |
+| `slim_old_tool_chars` | `1500` | 老工具结果压缩后保留的字符数（头尾各半） |
+| `slim_strip_reasoning` | `true` | 剥掉历史里的 reasoning/思考字段（上游不认，纯占位） |
+| `slim_merge_system` | `true` | 多条 system 消息合并成一条 |
+| `slim_dedupe_min_chars` | `3000` | 超这个长度的重复段落去重 |
+| `slim_para_min_chars` | `500` | 长段落里的空白/重复换行折叠阈值 |
 
 改完不需要重装，重启反代生效：`stop_all.bat` 后双击桌面 `workmom`。
 
@@ -232,7 +243,9 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 - `GET /health` —— 存活 + 当前模型 + 当前 uid + 模型清单；另带自检字段 `cdp` / `hint` / `cdp_port` /
   `cdp_timeout_sec` / `config_exists` / `wb_exe_exists` / `python` / `uptime_sec`，装完先看这一个就够定位。
   0.5.0 起再加 `transport` / `transport_ready` / `max_concurrency` / `direct` / `cdp_health` /
-  `cooldowns` / `usage` / `auto_heal` / `fallback_models`
+  `cooldowns` / `usage` / `auto_heal` / `fallback_models`；
+  0.5.1 起再加 `quotas`（各号各模型用量）/ `quota_switch_percent` / `quota_warn_percent` /
+  `audit_left`（审计还留几条）/ `slim`（瘦身开关与累计节省）
 - `GET /` `GET /panel` —— **Web 面板**（浏览器直接看，不用开 Tkinter）：通道健康、CDP 探活、限流冷却倒计时、
   用量账本、近期错误表，10 秒自动刷新
 - `GET /relay_state` —— 运行状态（守护只读消费，零额外 token）
@@ -274,6 +287,47 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 响应头另带 `Retry-After`（秒）与 `X-WM-Quota-Exceeded: 1`。
 同时反代按 `fallback_models` 顺序**自动降级**到下一个没用满的模型继续出字，只有全都被限才真的报 429。
 
+### 输入瘦身 slim（0.5.1 起）
+
+客户端每轮都把整段历史重发一遍，而工具返回（读文件、grep、日志、代码）动辄上万字，一轮轮叠上去输入 token 涨得比输出快得多。
+实测这类请求里**工具返回占输入 token 的 42.5%**，是第一大膨胀源。
+0.5.1 起反代在转发前对入参做四层**无副作用压缩**（只改发出去的副本，不改客户端、不改落盘）：
+
+| 层 | 做什么 | 开关 |
+| --- | --- | --- |
+| 1 老工具结果压缩 | 最近 `slim_keep_recent_tools` 条原样保留，更早的压成「头 65% + 尾 25% + 中间省略量标注」 | `slim_old_tool_chars` |
+| 2 剥 reasoning | 历史里的思考字段上游不认，纯占位，直接剥掉 | `slim_strip_reasoning` / `slim_keep_last_reasoning` |
+| 3 长重复去重 | 超 `slim_dedupe_min_chars` 的重复段落只留一份 | `slim_dedupe_min_chars` |
+| 4 system 合并 | 多条 system 消息合并成一条 | `slim_merge_system` |
+
+实测节省：**消息部分 −36%，含工具定义的全量 −29.8%**。上线头 23 次请求累计省下 **23.7 万 tok**，
+最近一次真实请求 59,792 → 42,735 tok（−28.5%）。
+
+不会打坏 prompt cache：瘦身是确定性的（同样的输入必然得到同样的输出），上游缓存照常命中。
+
+观测：响应头带 `X-WM-Slim-Before` / `X-WM-Slim-After` / `X-WM-Slim-Saved` / `X-WM-Slim-Pct`；
+`GET /health` 的 `slim` 块里有累计 `requests` / `saved_est_total` 和最后一次明细。想关掉设 `slim_enabled=false`。
+
+### 额度主动轮换（0.5.1 起）
+
+0.5.0 是「撞到 6004 才换号」，等于每次都要先浪费一次失败请求。0.5.1 起守护在主循环里做**前置判断**，四个条件同时满足才动手：
+
+1. 当前号该模型已用额度 ≥ `quota_switch_percent`（默认 92%）
+2. 距上次「额度换号」≥ `quota_switch_min_secs`（默认 900 秒，防抖）
+3. 当前不在限流退避窗口里
+4. 号池里存在比当前更干净的号
+
+任何一条不满足就原地不动 —— 尤其第 4 条，避免多号同窗限流时来回横跳却换不出额度。
+想早点换就把阈值调小，比如 `quota_switch_percent=80` 表示剩余 20% 就开始换。
+
+先看它想干什么（**零副作用，只判断不切号**）：
+
+```bat
+python workmom_guard.py --quota-check
+```
+
+会逐条打印阈值、当前用量、距上次换号多久、有没有更干净的号，最后给一句结论。加 `--probe` 会实打一次上游拿真实额度（那一次会计费）。
+
 ## 七、排障
 
 | 现象 | 先看哪 |
@@ -286,6 +340,8 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 | `setup.bat` 说 CDP 不通、自检失败 | 按它打印的手动命令带 `--remote-debugging-port=9226` 重启 WorkBuddy，再跑一次 `setup.bat` |
 | 反代没起来 / `端口监听 False` | `logs/relay.out.log`、`logs/relay.err.log`；多半是端口被旧进程占着，跑 `stop_all.bat` 再起 |
 | 切号没反应 | `logs/workmom.log` 里找「无感切号完成」；失败时看是不是 CDP 9226 不通（WorkBuddy 没带 `--remote-debugging-port=9226` 启动） |
+| 每轮输入 token 都很大，像历史被重发了一整遍 | 先确认瘦身是开着的：`curl -s http://127.0.0.1:18793/health` 看 `slim.enabled` 与 `slim.requests` 有没有在涨；再看响应头 `X-WM-Slim-Pct`（省了多少百分比）。如果 `saved_est_total` 一直是 0，多半是 `config.json` 里 `slim_enabled=false` 或进程没重启 |
+| 想确认「额度主动换号」到底判没判、为什么没换 | 跑 `python workmom_guard.py --quota-check`（零副作用，绝不切号）。它会逐条打印：阈值多少、当前号该模型已用多少、距上次换号多久、号池里有没有更干净的号，最后一句结论。四条件缺哪条一目了然 |
 | 领积分说"已签到" | 正常，`data/checkin.json` 里已有当天记录，别重复请求 |
 | 一直 6004 | 该账号该模型在滚动窗口里用完，看面板「限流倒计时」；换模型或等重置 |
 | 弹 `Windows Script Host` / `run_guard.vbs 第2行` / `缺少对象: 's'` / `800A01A8` | **换行符不是 CRLF**。VBScript 的注释行只认 `CR` 结束，纯 `LF` 的文件会让第 1 行注释把 `Set s = ...` 吞掉，于是 `s` 从未创建。修复：所有 `.vbs`/`.bat` 必须是 **CRLF + 纯 ASCII**（无中文注释、无 BOM）。批量转法：`$t = ($t -replace "`r`n","`n") -replace "`n","`r`n"` 后按单字节编码写回；改完用 `cscript //nologo xxx.vbs` 干跑验证退出码 0 |

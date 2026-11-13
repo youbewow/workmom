@@ -149,6 +149,25 @@ try:
 except Exception:
     STREAM_IDLE_TIMEOUT = 180.0
 
+# ---- 输入 token 审计 -------------------------------------------------------
+# audit_requests > 0 → 把接下来 N 次请求的「输入到底塞了什么」dump 到 logs/req_audit.jsonl，
+# 抓完自动归零。也可以临时用请求头 X-WM-Audit: 1 强制抓一条。0=关闭，不产生任何开销。
+try:
+    AUDIT_REQUESTS = max(0, int(_cfgval("audit_requests", 0) or 0))
+except Exception:
+    AUDIT_REQUESTS = 0
+AUDIT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "req_audit.jsonl")
+_AUDIT_LOCK = threading.Lock()
+_AUDIT_LEFT = [AUDIT_REQUESTS]
+
+# ---- 额度阈值自动换号 ------------------------------------------------------
+# 反代只负责「如实报告额度」，做不做换号由 workmom_guard 决定，两边靠 /relay_state 解耦。
+# 这里把当前模型的额度百分比塞进每个响应的头里，客户端（含守护）零成本读取。
+try:
+    QUOTA_SWITCH_PERCENT = float(_cfgval("quota_switch_percent", 92) or 92)
+except Exception:
+    QUOTA_SWITCH_PERCENT = 92.0
+
 # 并发闸门：ThreadingHTTPServer 本身不限制线程数，上游有账号级频率限制，
 # 无节制并发只会把 6004 提前触发，所以用信号量做「排队而不是被拒」
 _CONC_SEM = threading.BoundedSemaphore(MAX_CONCURRENCY)
@@ -447,11 +466,241 @@ def resolve_model(hdr_model=None, req_model=None):
     return _pick_name(hdr_model) or _pick_name(_active_model()) or _pick_name(req_model) or DEFAULT_MODEL
 
 
+# ---------------------------------------------------------------- 输入精简（slim）
+# 目的：客户端每轮把整段对话重发一遍（含旧思考、重复块、超长工具输出），
+# 输入 token 是输出的上百倍。这里在上游转发前做【不改变语义】的瘦身：
+#   1) 剥掉历史 assistant 的 reasoning_content（旧思考对下一轮毫无用处，占量却很大）
+#   2) 多条 system 合并成一条（顺序与内容不变，只是少一层结构）
+#   3) 删掉 content 为空又无 tool_calls 的废消息
+#   4) 完全相同且足够长的文本块，第二次起替换为引用标记
+#   5) 可选：超长 tool 结果按头尾保留截断（默认关，开启需显式配置）
+SLIM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "slim.jsonl")
+_SLIM_LOCK = threading.Lock()
+_SLIM_STAT = {"n": 0, "saved_est": 0, "last": {}}
+
+
+def _slim_cfg():
+    return {
+        "enabled": bool(_cfgval("slim_enabled", True)),
+        "strip_reasoning": bool(_cfgval("slim_strip_reasoning", True)),
+        "merge_system": bool(_cfgval("slim_merge_system", True)),
+        "dedupe_min_chars": int(_cfgval("slim_dedupe_min_chars", 3000) or 0),
+        "para_min_chars": int(_cfgval("slim_para_min_chars", 500) or 0),
+        "tool_max_chars": int(_cfgval("slim_tool_max_chars", 0) or 0),
+        "old_tool_chars": int(_cfgval("slim_old_tool_chars", 1500) or 0),
+        "keep_recent_tools": int(_cfgval("slim_keep_recent_tools", 3) or 0),
+        "keep_last_assistant_reasoning": bool(_cfgval("slim_keep_last_reasoning", False)),
+    }
+
+
+def _slim_truncate(text, limit):
+    """头 65% + 尾 25% 保留，中间标注省略量。"""
+    if limit <= 0 or len(text) <= limit:
+        return text, 0
+    head = int(limit * 0.65)
+    tail = int(limit * 0.25)
+    cut = len(text) - head - tail
+    marker = "\n\n…[workmom 已省略中间 %d 字符，保持头尾原文]…\n\n" % cut
+    return text[:head] + marker + text[-tail:], cut
+
+
+def _slim_content(c, cfg, seen, idx, role, stat):
+    """处理单条 content（str 或多模态 list），返回 (新content)。副作用写进 stat。"""
+    if isinstance(c, str):
+        return _slim_str(c, cfg, seen, idx, role, stat)
+    if isinstance(c, list):
+        out = []
+        for p in c:
+            if not isinstance(p, dict):
+                out.append(p)
+                continue
+            if p.get("type") == "text" and isinstance(p.get("text"), str):
+                q = dict(p)
+                q["text"] = _slim_str(p["text"], cfg, seen, idx, role, stat)
+                out.append(q)
+            else:
+                out.append(p)
+        return out
+    return c
+
+
+def _slim_paragraphs(text, min_len):
+    """段级去重：同一条消息内部若有完全相同的大段（常见于客户端把同一份说明/策略重复拼进 system），
+    第二次起替换成一行占位说明。只动 >=min_len 且逐字相同的段，语义零损失。"""
+    if min_len <= 0 or len(text) < min_len * 2 or "\n\n" not in text:
+        return text, 0
+    parts = text.split("\n\n")
+    if len(parts) < 3:
+        return text, 0
+    seen = {}
+    out = []
+    saved = 0
+    for p in parts:
+        key = p.strip()
+        if len(key) >= min_len:
+            h = hash(key)
+            hit = seen.get(h)
+            if hit and hit[1] == key:
+                mark = "[workmom 精简：本段与上文第 %d 段逐字相同（%d 字符），已省略]" % (hit[0] + 1, len(key))
+                out.append(mark)
+                saved += len(key) - len(mark)
+                continue
+            if not hit:
+                seen[h] = (len(out), key)
+        out.append(p)
+    if saved <= 0:
+        return text, 0
+    return "\n\n".join(out), saved
+
+
+def _slim_str(text, cfg, seen, idx, role, stat=None):
+    if not text:
+        return text
+    if stat is None:
+        stat = {}
+    # 超长工具/文档结果截断（默认关，slim_tool_max_chars>0 才生效）
+    if role == "tool":
+        new, cut = _slim_truncate(text, cfg["tool_max_chars"])
+        if cut > 0:
+            stat["tool_truncated"] = stat.get("tool_truncated", 0) + 1
+            text = new
+    # 长文本去重：同一段完全相同的长文本，第二次出现只留引用
+    minc = cfg["dedupe_min_chars"]
+    if minc > 0 and len(text) >= minc:
+        h = hash(text)
+        if h in seen:
+            mark = "[workmom 精简：此处内容与第 %d 条完全相同（%d 字符），已省略]" % (seen[h], len(text))
+            stat["deduped"] = stat.get("deduped", 0) + 1
+            return mark
+        seen[h] = idx
+    # 段级去重（防同一条 system 里重复拼接同一份内容）
+    new, ps = _slim_paragraphs(text, cfg["para_min_chars"])
+    if ps > 0:
+        stat["para_deduped"] = stat.get("para_deduped", 0) + 1
+        text = new
+    return text
+
+
+def slim_messages(msgs, model=""):
+    """对 messages 做语义无损瘦身，返回 (新msgs, stats)。stats 供日志与响应头使用。"""
+    cfg = _slim_cfg()
+    if not cfg["enabled"] or not isinstance(msgs, list):
+        return msgs, {"enabled": False, "before": 0, "after": 0, "saved": 0}
+
+    before_est = 0
+    for m in msgs:
+        if isinstance(m, dict):
+            before_est += _est_tokens(json.dumps(m, ensure_ascii=False))
+    if before_est < 1500:   # 小请求不值得动
+        return msgs, {"enabled": True, "before": before_est, "after": before_est,
+                      "saved": 0, "note": "skip-small"}
+
+    seen = {}
+    out = []
+    sys_buf = []
+    stat = {"reasoning": 0, "system_merged": 0, "empty_dropped": 0,
+            "deduped": 0, "tool_truncated": 0, "old_tool_trimmed": 0, "para_deduped": 0}
+
+    # 历史工具结果：最近 N 条保留原样（模型当前真正要用的），更早的压到 old_tool_chars
+    keep_set = set()
+    if cfg["keep_recent_tools"] > 0:
+        t_idx = [i for i, m in enumerate(msgs) if isinstance(m, dict) and m.get("role") == "tool"]
+        keep_set = set(t_idx[-cfg["keep_recent_tools"]:])
+
+    # 找最后一条 assistant 的下标（可选用法：保留最后一条的推理）
+    last_asst = -1
+    if cfg["keep_last_assistant_reasoning"]:
+        for i, m in enumerate(msgs):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                last_asst = i
+
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        m = dict(m)
+        role = m.get("role")
+        # 1) 剥旧思考
+        if cfg["strip_reasoning"] and role == "assistant" and i != last_asst:
+            for k in ("reasoning_content", "reasoning", "thinking"):
+                if m.pop(k, None) is not None:
+                    stat["reasoning"] += 1
+        # 2) system 合并（收集，稍后统一放最前）
+        if cfg["merge_system"] and role in ("system", "developer"):
+            c = m.get("content")
+            if isinstance(c, str):
+                sys_buf.append(c)
+            elif isinstance(c, list):
+                sys_buf.append("".join(x.get("text") or "" for x in c if isinstance(x, dict)))
+            continue
+        # 3) content 瘦身
+        #    3a) 历史工具结果先做激进压缩（最近 keep_recent_tools 条不动）
+        if role == "tool" and i not in keep_set:
+            c0 = m.get("content")
+            if isinstance(c0, str) and cfg["old_tool_chars"] > 0 and len(c0) > cfg["old_tool_chars"]:
+                nc, cut = _slim_truncate(c0, cfg["old_tool_chars"])
+                if cut > 0:
+                    m["content"] = nc
+                    stat["old_tool_trimmed"] += 1
+        c = _slim_content(m.get("content"), cfg, seen, i, role, stat)
+        if c is not None:
+            m["content"] = c
+        # 4) 空废消息
+        if (m.get("content") in (None, "", [])) and not m.get("tool_calls"):
+            stat["empty_dropped"] += 1
+            continue
+        out.append(m)
+
+    if sys_buf:
+        merged = "\n\n".join(sys_buf)
+        if len(sys_buf) > 1:
+            stat["system_merged"] = len(sys_buf) - 1
+        # 合并后的 system 也做段级去重（客户端常把同一份策略/说明重复拼两遍）
+        merged2, psaved = _slim_paragraphs(merged, cfg["para_min_chars"])
+        if psaved > 0:
+            stat["para_deduped"] += 1
+            merged = merged2
+        out.insert(0, {"role": "system", "content": merged})
+
+    after_est = 0
+    for m in out:
+        after_est += _est_tokens(json.dumps(m, ensure_ascii=False))
+    saved = max(0, before_est - after_est)
+    st = {"enabled": True, "before": before_est, "after": after_est,
+          "saved": saved, "pct": round(100.0 * saved / before_est, 1) if before_est else 0,
+          "model": model, "msgs_before": len(msgs), "msgs_after": len(out)}
+    st.update(stat)
+    _slim_record(st)
+    return out, st
+
+
+def _slim_record(st):
+    try:
+        with _SLIM_LOCK:
+            _SLIM_STAT["n"] += 1
+            _SLIM_STAT["saved_est"] += int(st.get("saved") or 0)
+            _SLIM_STAT["last"] = st
+        os.makedirs(os.path.dirname(SLIM_FILE), exist_ok=True)
+        rec = dict(st)
+        rec["at"] = int(time.time())
+        with open(SLIM_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        sys.stderr.write("[relay][slim] est %d→%d（省 %d, %.1f%%）reasoning=%d sys合并=%d 去重=%d\n"
+                         % (st.get("before") or 0, st.get("after") or 0, st.get("saved") or 0,
+                            st.get("pct") or 0, st.get("reasoning") or 0,
+                            st.get("system_merged") or 0, st.get("deduped") or 0))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def build_upstream_body(oai_req, model):
     """把【OpenAI 形状】的请求体加工成上游 body（含 max_tokens 抬升策略）。"""
+    msgs, _slim_st = slim_messages(oai_req.get("messages") or [], model=model)
+    oai_req["_slim"] = _slim_st
     body = {
         "model": model,
-        "messages": oai_req.get("messages") or [],
+        "messages": msgs,
         "stream": True,   # 上游强制流式
     }
     for k in ("temperature", "top_p", "stop", "tools", "tool_choice",
@@ -880,6 +1129,173 @@ def _note_usage(model, usage, kind="chat"):
 _load_usage()
 
 
+# ----------------------------------------------------------------------------
+# 额度快照 → 响应头：客户端不用额外探测就知道还剩多少，守护进程也靠它判断阈值
+# ----------------------------------------------------------------------------
+def _quota_headers(extra=None):
+    hdrs = dict(extra or {})
+    try:
+        if WT is None:
+            return hdrs
+        snap = WT.quota_snapshot() or {}
+        if not snap:
+            return hdrs
+        cur = _active_model()
+        item = snap.get(cur)
+        if not isinstance(item, dict):
+            cand = [v for v in snap.values() if isinstance(v, dict) and v.get("percent") is not None]
+            item = max(cand, key=lambda v: v.get("at") or 0) if cand else None
+        if not isinstance(item, dict) or item.get("percent") is None:
+            return hdrs
+        hdrs["X-WM-Quota-Percent"] = str(item.get("percent"))
+        ra = str(item.get("reset_at_human") or item.get("reset_at") or "")
+        if ra:
+            hdrs["X-WM-Quota-Reset"] = ra
+        hdrs["X-WM-Quota-Model"] = str(item.get("model") or cur or "")
+        if float(item.get("percent") or 0) >= QUOTA_SWITCH_PERCENT:
+            hdrs["X-WM-Quota-Near-Limit"] = "1"
+    except Exception:
+        pass
+    # 输入精简战果：before→after 与省下的估算 token，客户端/守护都能读
+    try:
+        last = _SLIM_STAT.get("last") or {}
+        if last.get("before"):
+            hdrs["X-WM-Slim-Before"] = str(last.get("before"))
+            hdrs["X-WM-Slim-After"] = str(last.get("after"))
+            hdrs["X-WM-Slim-Saved"] = str(last.get("saved"))
+            hdrs["X-WM-Slim-Pct"] = str(last.get("pct"))
+    except Exception:
+        pass
+    return hdrs
+
+
+# ----------------------------------------------------------------------------
+# 输入 token 审计：回答"每次请求到底把什么塞进了输入"
+# 只做统计与采样，不改动任何转发内容
+# ----------------------------------------------------------------------------
+def _est_tokens(text):
+    """中文按 1 字≈1 token、其余按 3.6 字符≈1 token 估算，够用且不依赖分词库。"""
+    if not text:
+        return 0
+    cjk = 0
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f" or "\uff00" <= ch <= "\uffef":
+            cjk += 1
+    return int(cjk + (len(text) - cjk) / 3.6)
+
+
+def _audit_take():
+    """判断这一条要不要审计；返回 True 后自动扣减配额。"""
+    with _AUDIT_LOCK:
+        if _AUDIT_LEFT[0] > 0:
+            _AUDIT_LEFT[0] -= 1
+            return True
+    return False
+
+
+def _audit_force():
+    with _AUDIT_LOCK:
+        return _AUDIT_LEFT[0] > 0
+
+
+def _audit_request(path, req, forced=False):
+    """把一次请求的输入构成统计落盘（roles / tools / 分段长度 / 估算 token）。"""
+    try:
+        if forced:
+            pass
+        elif not _audit_take():
+            return
+        msgs = req.get("messages")
+        if msgs is None and req.get("input") is not None:
+            msgs = req.get("input")
+        if isinstance(msgs, str):
+            msgs = [{"role": "user", "content": msgs}]
+        if not isinstance(msgs, list):
+            msgs = []
+        roles = {}
+        parts = []
+        total_chars = 0
+        total_est = 0
+        para_dups = []
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role") or ("user" if "content" in m else "?")
+            c = m.get("content")
+            if isinstance(c, list):
+                text = "".join(x.get("text") or "" for x in c if isinstance(x, dict))
+            else:
+                text = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+            tc = m.get("tool_calls")
+            if tc:
+                text += json.dumps(tc, ensure_ascii=False)
+            n = len(text)
+            est_n = _est_tokens(text)
+            total_chars += n
+            total_est += est_n
+            r = roles.setdefault(role, {"count": 0, "chars": 0, "est": 0})
+            r["count"] += 1
+            r["chars"] += n
+            r["est"] += est_n
+            if len(parts) < 40:
+                if n >= 400:
+                    _, psaved = _slim_paragraphs(text, 200)
+                    if psaved > 0:
+                        para_dups.append({"i": i, "role": role, "saved": psaved,
+                                          "head": " ".join(text[:80].split())})
+                parts.append({"i": i, "role": role, "chars": n,
+                              "est": _est_tokens(text),
+                              "head": " ".join(text[:120].split())})
+        sysc = req.get("system")
+        sys_text = ""
+        if isinstance(sysc, str):
+            sys_text = sysc
+        elif isinstance(sysc, list):
+            sys_text = "".join(x.get("text") or "" for x in sysc if isinstance(x, dict))
+        if sys_text:
+            total_chars += len(sys_text)
+            est_s = _est_tokens(sys_text)
+            total_est += est_s
+            r = roles.setdefault("system(param)", {"count": 1, "chars": 0, "est": 0})
+            r["chars"] += len(sys_text)
+            r["est"] += est_s
+            if len(parts) < 40:
+                parts.append({"i": -1, "role": "system(param)", "chars": len(sys_text),
+                              "est": est_s,
+                              "head": " ".join(sys_text[:120].split())})
+        tools = req.get("tools") or []
+        tools_text = json.dumps(tools, ensure_ascii=False) if tools else ""
+        rec = {
+            "at": int(time.time()),
+            "path": path,
+            "model": req.get("model") or "",
+            "stream": bool(req.get("stream")),
+            "msgs": len(msgs),
+            "total_chars": total_chars,
+            "est_total": total_est + _est_tokens(tools_text),
+            "est_messages": total_est,
+            "tools_n": len(tools) if isinstance(tools, list) else 0,
+            "tools_chars": len(tools_text),
+            "est_tools": _est_tokens(tools_text),
+            "roles": roles,
+            "parts": parts,
+            "top": sorted(parts, key=lambda x: -(x.get("chars") or 0))[:8],
+            "para_dups": para_dups,
+        }
+        os.makedirs(os.path.dirname(AUDIT_FILE), exist_ok=True)
+        with open(AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        sys.stderr.write("[relay][audit] %s model=%s msgs=%d chars=%d est_in≈%d tools≈%d\n"
+                         % (path, rec["model"], rec["msgs"], total_chars,
+                            rec["est_total"], rec["est_tools"]))
+        sys.stderr.flush()
+    except Exception as e:
+        try:
+            sys.stderr.write("[relay][audit] 失败: %s\n" % e)
+        except Exception:
+            pass
+
+
 def _sse(obj):
     return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
 
@@ -901,7 +1317,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        for k, v in (extra_headers or {}).items():
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-WM-Quota-Percent,X-WM-Quota-Reset,X-WM-Quota-Model,X-WM-Quota-Near-Limit")
+        for k, v in _quota_headers(extra_headers).items():
             self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(data)
@@ -936,6 +1354,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Expose-Headers",
+                         "X-WM-Quota-Percent,X-WM-Quota-Reset,X-WM-Quota-Model,X-WM-Quota-Near-Limit")
+        for k, v in _quota_headers().items():
+            self.send_header(k, str(v))
         self.end_headers()
 
     def do_OPTIONS(self):
@@ -948,6 +1370,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
+        # 输入 token 审计开关：GET /admin/audit?n=3 抓接下来 3 次请求的输入构成
+        # 不加参数只查询剩余次数，不重启反代就能改，省得为了抓一次样本动服务
+        if path in ("/admin/audit", "/audit"):
+            n = None
+            if "?" in self.path:
+                for kv in self.path.split("?", 1)[1].split("&"):
+                    if kv.startswith("n="):
+                        try:
+                            n = int(float(kv[2:]))
+                        except Exception:
+                            n = 0
+            if n is not None:
+                with _AUDIT_LOCK:
+                    _AUDIT_LEFT[0] = max(0, n)
+            return self._json(200, {
+                "audit_left": _AUDIT_LEFT[0],
+                "file": AUDIT_FILE,
+                "hint": "GET /admin/audit?n=3 → 抓接下来 3 次请求；请求头 X-WM-Audit: 1 可强制单次",
+            })
         # 根路径 = 真·Web 面板（以前返回 /health 的 JSON，README 却说"浏览器打开就是面板"，对不上）
         if path in ("", "/panel", "/index.html", "/dashboard"):
             try:
@@ -1049,6 +1490,12 @@ class Handler(BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8", "replace") or "{}")
         except Exception as e:
             return self._json(400, {"error": {"message": "invalid json: %s" % e, "type": "invalid_request_error"}})
+
+        # 输入 token 审计：只统计不转发，audit_requests>0 或请求头 X-WM-Audit:1 时才写盘
+        if path in ("/v1/chat/completions", "/chat/completions", "/v1/messages", "/messages",
+                    "/v1/responses", "/responses"):
+            _audit_request(path, req,
+                           forced=str(self.headers.get("X-WM-Audit") or "").strip() == "1")
 
         if path in ("/v1/chat/completions", "/chat/completions"):
             return self.chat(req)
@@ -1405,6 +1852,12 @@ def _health_extra():
             cooldowns = WT.cooldown_snapshot()
         except Exception:
             cooldowns = []
+    quotas = {}
+    if WT is not None:
+        try:
+            quotas = WT.quota_snapshot()
+        except Exception:
+            quotas = {}
     return {
         "transport": TRANSPORT,
         "transport_ready": {"direct": WT is not None and RS is not None,
@@ -1415,6 +1868,14 @@ def _health_extra():
         "direct": direct,
         "cdp_health": cdp,
         "cooldowns": cooldowns,
+        "quotas": quotas,
+        "quota_switch_percent": QUOTA_SWITCH_PERCENT,
+        "quota_warn_percent": QUOTA_WARN_PERCENT,
+        "audit_left": _AUDIT_LEFT[0],
+        "slim": {"enabled": _slim_cfg()["enabled"],
+                 "requests": _SLIM_STAT.get("n") or 0,
+                 "saved_est_total": _SLIM_STAT.get("saved_est") or 0,
+                 "last": _SLIM_STAT.get("last") or {}},
         "usage": usage,
     }
 

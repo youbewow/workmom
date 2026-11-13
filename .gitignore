@@ -28,3 +28,6 @@ desktop.ini
 .idea/
 *.lnk
 *.log
+
+# ---- 中间产物（探测脚本 / 临时分析，不入库）----
+temp/

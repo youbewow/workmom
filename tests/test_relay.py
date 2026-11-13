@@ -126,8 +126,11 @@ def run_tests():
                                                    "content": "从1数到40，每个数字后用顿号隔开"}]},
             stream=True)
     ttfb = c["ttfb"] or 0
-    ok_c = (c["status"] == 200 and ttfb > 0 and c["dur"] > 2
-            and ttfb < max(3.0, c["dur"] * 0.6))
+    # 真流式判定：首包明显早于整体完成，且后续确实持续有增量行推进。
+    # 上游首包本身可能就慢（思考型模型 5s+），所以比例阈值放到 0.85，
+    # 再用行数门槛兜住"攒完再一次性吐"的伪流式（那种首包≈总时长、行数也少）。
+    ok_c = (c["status"] == 200 and ttfb > 0 and c["dur"] > 2 and c["lines"] >= 20
+            and ttfb < max(3.0, c["dur"] * 0.85))
     add("C chat 真流式", ok_c,
         "首字节 %.2fs / 总 %.2fs / %d 行（伪流式时两者会几乎相等）"
         % (ttfb, c["dur"], c["lines"]))
@@ -139,9 +142,9 @@ def run_tests():
             stream=True)
     dt = d["ttfb"] or 0
     ok_d = (d["status"] == 200 and dt > 0 and "content_block_delta" in d["body"]
-            and dt < max(3.0, d["dur"] * 0.6))
-    add("D anthropic 真流式", ok_d, "首字节 %.2fs / 总 %.2fs / 事件=%s"
-        % (dt, d["dur"], "yes" if "content_block_delta" in d["body"] else "no"))
+            and d["lines"] >= 20 and dt < max(3.0, d["dur"] * 0.85))
+    add("D anthropic 真流式", ok_d, "首字节 %.2fs / 总 %.2fs / %d 行 / 事件=%s"
+        % (dt, d["dur"], d["lines"], "yes" if "content_block_delta" in d["body"] else "no"))
 
     # ---------- E ----------
     e = req("/v1/responses", {"model": "kimi-k3-2", "stream": True,
@@ -150,7 +153,8 @@ def run_tests():
                                                       "text": "从1数到40，每个数字后用顿号隔开"}]}]},
             stream=True)
     et = e["ttfb"] or 0
-    ok_e = e["status"] == 200 and et > 0 and et < max(3.0, e["dur"] * 0.6)
+    ok_e = (e["status"] == 200 and et > 0 and e["lines"] >= 20
+            and et < max(3.0, e["dur"] * 0.85))
     add("E responses 真流式", ok_e, "首字节 %.2fs / 总 %.2fs / %d 行"
         % (et, e["dur"], e["lines"]))
 
