@@ -1243,6 +1243,8 @@ def _quota_headers(extra=None):
             snap = WT.quota_snapshot() or {}
             cand = [v for v in snap.values() if isinstance(v, dict) and v.get("percent") is not None]
             item = max(cand, key=lambda v: v.get("at") or 0) if cand else None
+        if isinstance(item, dict) and not _quota_entry_live(item):
+            item = None     # 过期快照不许再冒充当下发给客户端（否则对面直接判满不切号）
         if not isinstance(item, dict) or item.get("percent") is None:
             return hdrs
         hdrs["X-WM-Quota-Percent"] = str(item.get("percent"))
@@ -1936,6 +1938,46 @@ def _watchdog():
         time.sleep(45)
 
 
+def _reset_ts_human(txt):
+    """把 "2026-11-14 17:54:41" / "11-14 22:56" 解析成本地时间戳，失败返回 None。"""
+    s = str(txt or "").strip()
+    if not s:
+        return None
+    cands = [s]
+    if len(s) <= 11 and ":" in s:
+        cands.append("%d-%s" % (time.localtime().tm_year, s))
+    for c in cands:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return time.mktime(time.strptime(c, fmt))
+            except Exception:
+                continue
+    return None
+
+
+def _quota_entry_live(v):
+    """一条额度快照是否还能代表当下。
+
+    反代只在「真实撞到 429/6004」或「成功响应带 usage.quota」时更新快照。撞墙之后如果
+    不再有流量，那条 100% 会一直挂在内存里——一旦它自己声明的 reset 时刻已经过去，
+    说明额度早就重置了，必须作废，否则客户端/守护会被一条过期快照永久判成「额度耗尽」。
+    没有 reset 信息的（纯 exhausted 标记）只认 30 分钟内的新鲜度，防止脏数据长期滞留。
+    """
+    if not isinstance(v, dict):
+        return False
+    try:
+        at = float(v.get("at") or 0)
+    except Exception:
+        at = 0.0
+    now = time.time()
+    rst = _reset_ts_human(v.get("reset_at_human") or v.get("reset_at"))
+    if rst:
+        if rst <= now:                 # 自己声明要重置的时刻已经过了 → 作废
+            return False
+        return (not at) or (now - at) <= 6 * 3600   # 有 reset 的宽限 6 小时
+    return bool(at) and (now - at) <= 1800          # 无 reset 只有 30 分钟
+
+
 def _health_extra():
     """给 /health、/relay_state 共用的运行时状态块。"""
     with _DIRECT_LOCK:
@@ -1964,18 +2006,26 @@ def _health_extra():
             snap = WT.quota_snapshot() or {}
             uid = _cur_uid()
             for k, v in snap.items():
-                if isinstance(v, dict) and (v.get("uid") or "") == uid:
+                if isinstance(v, dict) and (v.get("uid") or "") == uid and _quota_entry_live(v):
                     quotas[v.get("model") or str(k).split("|")[-1]] = v
             if not quotas:      # 拿不到当前号记录时退回全量，别让守护看到空额度
                 for k, v in snap.items():
-                    if isinstance(v, dict):
+                    if isinstance(v, dict) and _quota_entry_live(v):
                         quotas[v.get("model") or str(k).split("|")[-1]] = v
         except Exception:
             quotas = {}
         try:
-            quotas_by_uid = WT.quota_by_uid() or {}
+            raw_by_uid = WT.quota_by_uid() or {}
         except Exception:
-            quotas_by_uid = {}
+            raw_by_uid = {}
+        # 逐行喂给面板前先作废过期快照，别让 5 小时前撞墙的 100% 冒充当下
+        quotas_by_uid = {}
+        for u, per in raw_by_uid.items():
+            if not isinstance(per, dict):
+                continue
+            keep = {m: v for m, v in per.items() if _quota_entry_live(v)}
+            if keep:
+                quotas_by_uid[u] = keep
     return {
         "uid": _cur_uid(),
         "transport": TRANSPORT,

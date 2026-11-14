@@ -146,6 +146,45 @@ def load_qprobe():
     return d if isinstance(d, dict) else {}
 
 
+def _reset_ts(txt):
+    """把 "2026-11-14 17:54:41" / "11-14 22:56" 解析成本地时间戳，失败返回 None。"""
+    s = (txt or "").strip()
+    if not s:
+        return None
+    cands = [s]
+    if len(s) <= 11 and ":" in s:          # 无年份，补当前年
+        cands.append("%d-%s" % (time.localtime().tm_year, s))
+    for c in cands:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return time.mktime(time.strptime(c, fmt))
+            except Exception:
+                continue
+    return None
+
+
+def _quota_live(item, ttl=1800):
+    """反代实测的额度快照是否还能代表当下：既没过 TTL，也没跨过它自己声明的重置时刻。
+
+    反代只在真实撞 429/6004 或成功响应带 usage.quota 时才更新快照，撞墙后如果不再
+    有流量，那条 100% 会一直挂在那儿；一旦它声明的 reset 时间已过，说明额度早重置了，
+    必须作废，否则面板会永远显示「额度耗尽」。
+    """
+    if not isinstance(item, dict):
+        return False
+    try:
+        at = float(item.get("at") or 0)
+    except Exception:
+        at = 0.0
+    now = time.time()
+    rst = _reset_ts(item.get("reset_at_human") or item.get("reset_at"))
+    if rst:
+        if rst <= now:                 # 它自己声明的重置时刻已过 → 这条快照作废
+            return False
+        return (not at) or (now - at) <= 6 * 3600
+    return bool(at) and (now - at) <= ttl
+
+
 def quota_of(uid, model, qby, probe, ttl=1800):
     """某个账号在某模型上的「已用额度」百分比。
 
@@ -157,7 +196,7 @@ def quota_of(uid, model, qby, probe, ttl=1800):
         per = qby.get(uid)
         if isinstance(per, dict):
             item = per.get(model)
-    if isinstance(item, dict):
+    if _quota_live(item, ttl):
         try:
             if item.get("percent") is not None:
                 return (float(item.get("percent")), "实测",
@@ -171,7 +210,11 @@ def quota_of(uid, model, qby, probe, ttl=1800):
     if isinstance(hit, dict) and hit.get("percent") is not None:
         try:
             at = float(hit.get("at") or 0)
-            if time.time() - at <= ttl:
+            rst = _reset_ts(hit.get("reset") or hit.get("reset_at"))
+            fresh = (time.time() - at) <= ttl
+            if rst and rst <= time.time():
+                fresh = False     # 探测记录自己声明的重置时刻已过，这条 100% 不再代表当下
+            if fresh:
                 return (float(hit.get("percent")), "探测",
                         str(hit.get("reset") or hit.get("reset_at") or ""),
                         float(hit.get("percent")) >= 99.5)
@@ -281,17 +324,21 @@ class App:
                           font=("Microsoft YaHei UI", 9), padx=pad, pady=3, cursor="hand2")
             return b
 
-        mkbtn(top, "立即刷新", self.safe_refresh).pack(side="right")
+        self.btn_refresh = mkbtn(top, "立即刷新", self.safe_refresh)
+        self.btn_refresh.pack(side="right")
         mkbtn(top, "重启 WB(兜底)", self.restart_wb_manual, YELLOW, 10).pack(side="right", padx=(0, 8))
 
         tk.Checkbutton(top, text="自动刷新(5s)", variable=self.auto, bg=BG, fg=MUTED,
                        selectcolor=PANEL, activebackground=BG, activeforeground=FG,
                        font=("Microsoft YaHei UI", 9)).pack(side="right", padx=(0, 10))
 
-        self.on_top = tk.BooleanVar(value=False)
+        self.on_top = tk.BooleanVar(value=True)
         tk.Checkbutton(top, text="窗口置顶", variable=self.on_top, command=self._toggle_top,
                        bg=BG, fg=MUTED, selectcolor=PANEL, activebackground=BG,
                        activeforeground=FG, font=("Microsoft YaHei UI", 9)).pack(side="right", padx=(0, 10))
+        # 默认置顶：面板被浏览器/资源管理器压住时，点击根本落不到 Tk 窗口上，
+        # 用户会以为"点了没反应"。这里不靠用户手动勾，启动即置顶。
+        self._toggle_top()
 
         # 第二行按钮：登录 / 签到
         top2 = tk.Frame(root, bg=BG)
@@ -387,12 +434,72 @@ class App:
         self.refresh_all()
         self.tick()
         self.root.after(2500, self._auto_claim_once)
+        self.root.after(1200, self._dump_geom)
+
+    def _dump_geom(self):
+        """把窗口和「立即刷新」按钮的屏幕坐标落到 data/ui_geom.json。
+
+        排查"点了没反应"时可以直接拿真实坐标做点击测试，不用靠肉眼估位置；
+        面板换了布局也顺手刷新这份坐标。
+        """
+        try:
+            # 窗口这里才真正映射完成，置顶必须在映射后再设一次（构造期设会被丢弃）
+            if bool(self.on_top.get()):
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+            w = self.btn_refresh
+            geo = {
+                "window": [self.root.winfo_rootx(), self.root.winfo_rooty(),
+                           self.root.winfo_width(), self.root.winfo_height()],
+                "btn_refresh": [w.winfo_rootx() + w.winfo_width() // 2,
+                                w.winfo_rooty() + w.winfo_height() // 2],
+                "topmost": bool(self.on_top.get()),
+                "at": time.time(),
+            }
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "data", "ui_geom.json"), "w", encoding="utf-8") as f:
+                json.dump(geo, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 刷新
-    def safe_refresh(self):
-        """刷新兜底：任何一次异常都不许把界面刷新链打断（断了就是"点了没反应"）。"""
+    def safe_refresh(self, silent=False):
+        """刷新兜底：任何一次异常都不许把界面刷新链打断（断了就是"点了没反应"）。
+
+        silent=True 给自动刷新用：不抢按钮态、不覆盖状态栏，只默默更数据。
+        手动点按钮时先立刻画出「刷新中…」，数据回来再报耗时，点击必有回执。
+        """
+        t0 = time.time()
+        btn = getattr(self, "btn_refresh", None)
+        if not silent:
+            try:
+                if btn is not None:
+                    btn.config(text="刷新中…", state="disabled")
+                self.set_bar("正在刷新数据…", YELLOW)
+                self.root.update_idletasks()
+            except Exception:
+                pass
         try:
             self.refresh_all()
+            self._auto_cnt = getattr(self, "_auto_cnt", 0) + 1
+            if not silent:
+                self._manual_cnt = getattr(self, "_manual_cnt", 0) + 1
+                try:
+                    self.set_bar("✔ 已刷新 %s · 耗时 %.2fs · 手动第 %d 次"
+                                 % (time.strftime("%H:%M:%S"), time.time() - t0,
+                                    self._manual_cnt), GREEN)
+                except Exception:
+                    pass
+                # 每次手动刷新都留一行凭据，"点了没反应"这种扯皮可以直接翻日志
+                try:
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "data", "panel_actions.log"), "a",
+                              encoding="utf-8") as _f:
+                        _f.write("[%s] 手动刷新 #%d · 耗时 %.2fs\n"
+                                 % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    self._manual_cnt, time.time() - t0))
+                except Exception:
+                    pass
             return True
         except Exception as e:
             import traceback
@@ -402,14 +509,20 @@ class App:
             except Exception:
                 pass
             try:
-                p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "logs", "panel_error.log")
-                with open(p, "a", encoding="utf-8") as f:
+                fp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "logs", "panel_error.log")
+                with open(fp, "a", encoding="utf-8") as f:
                     f.write("[%s] 刷新异常\n%s\n" %
                             (time.strftime("%Y-%m-%d %H:%M:%S"), traceback.format_exc()))
             except Exception:
                 pass
             return False
+        finally:
+            if btn is not None:
+                try:
+                    btn.config(text="立即刷新", state="normal")
+                except Exception:
+                    pass
 
     def refresh_all(self):
         t0 = time.time()
@@ -468,7 +581,9 @@ class App:
             if status == "ok":
                 st_txt = "可用"
             elif status == "limited":
-                if clear_at and clear_at <= time.time():
+                if pct is not None and pct < 99.5:
+                    st_txt = "可用"      # 已有新鲜额度数据证明它没满，旧的限流标记作废
+                elif clear_at and clear_at <= time.time():
                     st_txt = "待复测"
                 else:
                     st_txt = "限流中"
@@ -854,7 +969,7 @@ class App:
         if self.auto.get():
             self._cnt = getattr(self, "_cnt", 0) + 1
             if self._cnt % 5 == 0:
-                self.safe_refresh()
+                self.safe_refresh(silent=True)
 
 
 def main():

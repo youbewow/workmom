@@ -639,6 +639,14 @@ def switch_next(cfg, st, reason="6004", dry=False):
         tried = set()
         st["round_started_at"] = time.time()
 
+    # 挑号顺序按额度升序（缓存版），别让队列里排在前面的满额号白白吃掉一轮尝试
+    try:
+        ranked = [u for u, _p, _n in _queue_quota_rank(cfg, st.get("model") or "", cur)]
+        if ranked:
+            queue = ranked
+    except Exception as e:
+        log("按额度排序候选号失败（%s），退回原始队列顺序" % str(e)[:80])
+
     for uid in queue:
         if uid == cur:
             continue
@@ -738,6 +746,43 @@ def _qprobe_save(d):
         os.replace(tmp, QPROBE_FILE)
     except Exception as e:
         log("写额度探测缓存失败: %s" % e)
+
+
+def _qreset_ts(txt):
+    """把 "11-15 02:28" / "2026-11-15 02:28:39" 解析成本地时间戳，失败返回 None。"""
+    s = str(txt or "").strip()
+    if not s:
+        return None
+    cands = [s]
+    if len(s) <= 11 and ":" in s:          # 无年份，补当前年
+        cands.append("%d-%s" % (time.localtime().tm_year, s))
+    for c in cands:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return time.mktime(time.strptime(c, fmt))
+            except Exception:
+                continue
+    return None
+
+
+def _qcache_live(hit, now=None):
+    """缓存里的额度还能不能代表当下：既没过 PROBE_TTL，也没跨过它自己声明的重置时刻。
+
+    撞墙那一刻写进去的 100% 会一直躺在缓存里，一旦它声明的 reset 时间过了，额度其实
+    早就回来了；只认 TTL 的话，面板和挑号逻辑会在这段时间里继续把好号当满额。
+    """
+    if not isinstance(hit, dict):
+        return False
+    now = now or time.time()
+    try:
+        if now - int(hit.get("at") or 0) > PROBE_TTL:
+            return False
+    except Exception:
+        return False
+    rst = _qreset_ts(hit.get("reset_at") or hit.get("reset"))
+    if rst and rst <= now:
+        return False
+    return True
 
 
 def probe_quota(cfg, uid, model, ttl=PROBE_TTL, dry=False):
@@ -873,7 +918,7 @@ def sweep_quotas(cfg, rs=None):
     for uid in q:
         key = "%s|%s" % (uid, model)
         hit = cache.get(key)
-        if isinstance(hit, dict) and now - int(hit.get("at") or 0) <= PROBE_TTL:
+        if _qcache_live(hit, now):
             continue
         pct, rst, note = probe_quota(cfg, uid, model)
         n += 1
@@ -887,32 +932,73 @@ def sweep_quotas(cfg, rs=None):
     return n
 
 
+def _queue_quota_rank(cfg, model, cur=""):
+    """把队列里的候选号按「额度从低到高」排好：已知干净的排前面、额度未知的居中、满额的最后。
+
+    只读 quota_probe_cache.json（后台巡检线程负责刷新缓存），不在此处发上游请求，
+    所以全队列扫描的成本只是一次文件读。
+    """
+    q = list(cfg.get("queue") or _load_queue(cfg) or [])
+    cache = _qprobe_load() or {}
+    now = int(time.time())
+    tm = model or ""
+    known, unknown, full = [], [], []
+    for idx, uid in enumerate(q):
+        if not uid or uid == cur:
+            continue
+        hit = cache.get("%s|%s" % (uid, tm)) if tm else None
+        pct = None
+        if _qcache_live(hit, now):
+            try:
+                pct = float(hit.get("percent"))
+            except Exception:
+                pct = 100.0 if hit.get("exhausted") else None
+        item = (idx, uid, pct)
+        if pct is None:
+            unknown.append(item)
+        elif pct >= 99.5:
+            full.append(item)
+        else:
+            known.append(item)
+    known.sort(key=lambda x: (x[2], x[0]))
+    full.sort(key=lambda x: (x[2], x[0]))
+    ordered = known + unknown + full
+    return [(uid, pct, "缓存" if pct is not None else "无缓存") for _i, uid, pct in ordered]
+
+
 def _all_quota_low(cfg, rs, th, st):
-    """判断队列里是不是已经没有比阈值更干净的号了。
+    """判断队列里是不是已经没有比阈值更干净的号了（扫全队列，不再只看前 3 个）。
 
     返回 True = 没有更干净的号，别切（切了也是撞墙，还会把 6004 引出来、把别的号也染上冷却）。
-    返回 False = 有干净号，可以切。
+    返回 False = 有干净号（或全部未知），可以切。
     探测不到的号按"未知"处理，当作可以切——交给 6004 兜底，总比一动不动强。
     """
     model = (rs or {}).get("model") or st.get("model") or ""
     cur = (rs or {}).get("uid") or st.get("current_uid") or ""
-    q = cfg.get("queue") or _load_queue(cfg)
-    cands = [u for u in q if u != cur]
-    if not cands:
+    rank = _queue_quota_rank(cfg, model, cur)
+    if not rank:
+        log("队列里没有别的候选号（共 %d 个），保持当前号" % len(cfg.get("queue") or []))
         return True
-    tried = 0
-    for uid in cands:
-        if tried >= 3:
-            break
-        tried += 1
-        pct, _rst, note = probe_quota(cfg, uid, model)
+
+    unknown = []
+    for uid, pct, note in rank:
         if pct is None:
-            log("候选号 %s 额度未知（%s），允许切换，交给 6004 兜底" % (uid[:12], note))
-            return False
+            unknown.append(uid)
+            continue
         if pct < th:
-            log("候选号 %s 额度 %.1f%% < 阈值 %.0f%%，可以切" % (uid[:12], pct, th))
+            log("候选号 %s 额度 %.1f%% < 阈值 %.0f%%（全队列 %d 个候选已扫完），可以切"
+                % (uid[:12], pct, th, len(rank)))
             return False
-        log("候选号 %s 额度 %.1f%% 也偏高，跳过" % (uid[:12], pct))
+
+    known = [(u, pct) for u, pct, _n in rank if pct is not None]
+    if known:
+        bu, bp = min(known, key=lambda x: x[1])
+        log("全队列 %d 个候选都扫过：最干净的 %s 也有 %.1f%%（>= 阈值 %.0f%%），当前号先扛着"
+            % (len(rank), bu[:12], bp, th))
+    if unknown:
+        log("另有 %d 个候选号额度未知（缓存未覆盖：%s），允许切过去交给 6004 兜底"
+            % (len(unknown), ",".join(u[:8] for u in unknown[:4])))
+        return False
     return True
 
 
@@ -1020,11 +1106,11 @@ def do_quota_check(cfg, st, probe=False):
     print("   整队退避期    : %s" % ("无 ✓" if backoff_ok else "剩 %ds ✗" % left))
     if probe:
         low = _all_quota_low(cfg, rs, th, st)
-        print("   队列是否有更干净号:", "无（探测过前3个）✗" if low else "有 ✓")
+        print("   队列是否有更干净号:", "无（全队列已扫）✗" if low else "有 ✓")
     else:
         low = None
         cache = _qprobe_load()
-        print("   队列探测      : 未开启（加 --probe 真探测前面几个号的额度，会各消耗 1 token）")
+        print("   队列探测      : 未开启（加 --probe 用缓存扫全队列额度；缓存未命中的号会各消耗 1 token 真探测）")
         for k, v in list(cache.items())[:5]:
             print("      %s → %s%%  %ds前" % (k.replace("|", " | "), v.get("percent"),
                                             int(time.time() - int(v.get("at") or 0))))

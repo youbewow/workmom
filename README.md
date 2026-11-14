@@ -362,6 +362,25 @@ python workmom_guard.py --quota-check
 一开始就是「刷新一下就不动」的状态。现在统一走 `safe_refresh()`，`_tick_body()` 把取数、格式化、渲染分段隔离，
 任何一列缺失按 `—` 补位，异常写 `logs/panel_error.log` 后继续排下一次刷新，不用重开面板。
 
+### 额度读数只认「新鲜的」（0.5.3 起）
+
+0.5.2 让额度可见，但可见的是**带时间戳的历史快照**，而读取端没人看那个时间戳。典型后果：某个号 18:00 撞了
+6004 记下 `100%`，它的 `reset_at`（17:54）其实早就过了、额度已经回来了，但只要它之后没被请求过，面板就会一直
+给它标红「额度耗尽」，守护挑号也把它排在队尾 —— 明明是最干净的号，反而最后一个被选中。
+
+0.5.3 把所有读取端统一到一个口径：**一条额度读数只有在「没过 TTL」且「它自己声明的 `reset_at` 还没到」时才算数**，
+否则当场作废、回落到重新探测。
+
+| 位置 | 0.5.3 前 | 0.5.3 后 |
+| --- | --- | --- |
+| `/relay_state` 的 `quotas` / `quotas_by_uid` | 原样吐出，过期不管 | `_quota_entry_live()` 逐条作废过期快照，`exhausted` 不再虚报 |
+| 响应头 `X-WM-Quota-*` | 过期快照照样发，客户端拿到假满额就判死不切号 | `_quota_headers()` 走同一道校验，过期就不发 |
+| 面板 `quota_of()` | 实测分支直接 `return exhausted=True` | `_reset_ts()` / `_quota_live()` 校验，实测与探测两分支都过 |
+| 守护挑号 `_queue_quota_rank()` / 额度巡检 | 只判 `PROBE_TTL`，撞墙的 100% 能在缓存里躺满 30 分钟 | `_qcache_live()` 同时判 TTL 与 `reset_at`，过期即视为未知、重新探测 |
+
+附带两个体验修正：面板默认置顶（`-topmost`，构造期设置的会被 Tk 丢掉，所以映射完成后补设一次），
+手动刷新会写 `data/panel_actions.log` 并在状态栏回执「手动第 N 次 · 耗时 X.XXs」，按钮点击期间显示「刷新中…」并禁用。
+
 ## 七、排障
 
 | 现象 | 先看哪 |
@@ -376,6 +395,9 @@ python workmom_guard.py --quota-check
 | 切号没反应 | `logs/workmom.log` 里找「无感切号完成」；失败时看是不是 CDP 9226 不通（WorkBuddy 没带 `--remote-debugging-port=9226` 启动） |
 | 面板「额度已用」列一直显示 `—` | 守护还没跑过一轮额度巡检（等 `quota_sweep_secs`，默认 10 分钟），或探测被上游拒。手动触发一次：`python workmom_guard.py --quota-check`（零副作用）或加 `--probe` 实打一次；看 `logs/workmom.log` 里有没有「全号额度」相关行 |
 | 面板刷新一下就不动了 / 按钮全失灵 | 0.5.2 已修（列数与数据长度不等导致 `_tick` 抛异常中断）。若仍出现：看 `logs/panel_error.log` 最新一行；确认跑的是新进程，`stop_all.bat` 后重起 |
+| 某个号明明没用过，面板却标「额度耗尽」 | 0.5.3 已修（旧快照不看 `reset_at` 就直接判满）。想当场核实：`python workmom_guard.py --quota-check --probe` 看它真实用了多少；若面板仍标红，先确认跑的是新进程（`stop_all.bat` 后重起），再删 `data/quota_probe_cache.json` 让巡检重探一轮 |
+| 点「刷新」没反应 | 0.5.3 起面板默认置顶；若关掉了置顶，按钮可能被别的窗口压住（点的是别的程序）。看 `data/panel_actions.log` 有没有新行：没有＝点击根本没进面板，把窗口切上来再点；有＝刷新已执行，看状态栏「手动第 N 次 · 耗时」 |
+| 响应头里 `X-WM-Quota-Percent` 突然没了 | 正常。0.5.3 起过期快照不再发（八成是当前号那条读数已跨过 `reset_at` 或超 TTL），等下一次成功请求会重新带上 |
 | 日志里切号成功刚 10 秒就又报「额度 93% 超阈值但暂不动」 | 正常。切号瞬间反代进程还按旧号视角回 `/relay_state`，那几秒读到的仍是旧号残留读数；`current_quota` 有 uid 校验 + `quota_stale_since` 双重过滤，判不出当前号就 `None` 不动，不会瞎切。等反代刷新到新号即恢复（通常十几秒），想立刻确认跑 `--quota-check` |
 | 每轮输入 token 都很大，像历史被重发了一整遍 | 先确认瘦身是开着的：`curl -s http://127.0.0.1:18793/health` 看 `slim.enabled` 与 `slim.requests` 有没有在涨；再看响应头 `X-WM-Slim-Pct`（省了多少百分比）。如果 `saved_est_total` 一直是 0，多半是 `config.json` 里 `slim_enabled=false` 或进程没重启 |
 | 想确认「额度主动换号」到底判没判、为什么没换 | 跑 `python workmom_guard.py --quota-check`（零副作用，绝不切号）。它会逐条打印：阈值多少、当前号该模型已用多少、距上次换号多久、号池里有没有更干净的号，最后一句结论。四条件缺哪条一目了然 |
