@@ -184,7 +184,18 @@ _DIRECT_STAT = {
 _CDP_HEALTH = {"ok": None, "fail_streak": 0, "last_check": 0, "last_err": "",
                "healed_at": 0, "heal_count": 0}
 
-DEFAULT_MODEL = (WM.active_model() if WM is not None else "kimi-k3.1-pro")
+# 这里绝不能把「面板当时的模型」冻成 import 期常量：hy4-free 下线那次，常量被冻死在
+# 已下线模型上，客户端填任何模型最后都退回这个死模型，于是全员 11102。
+def _default_model():
+    """兜底模型：config.default_model → 面板当前模型 → 内置默认，取第一个认得的。"""
+    for m in (_cfgval("default_model"),
+              (_active_model() if WM is not None else ""),
+              "kimi-k3.1-pro"):
+        n = _pick_name(m)
+        if n:
+            return n
+    return "kimi-k3.1-pro"
+
 KNOWN_MODELS = _known_models()
 
 
@@ -454,17 +465,87 @@ def call_upstream(body):
 # 模型选择 / 上游请求构造（三种协议共用）
 # ----------------------------------------------------------------------------
 
+def _model_whitelist():
+    """认得的模型名：known_models ∪ fallback_models ∪ default_model ∪ 内置两个。
+
+    以前只认 known_models（本机是空的，实际靠兜底的两个），于是 fallback_models 里
+    写 deepseek-v4-pro 会被当成陌生名字直接丢掉 —— 降级链永远是空转。
+    """
+    out = []
+
+    def _push(m):
+        m = str(m or "").strip().split("/")[-1].split(":")[-1].strip()
+        if m and m not in out:
+            out.append(m)
+
+    for m in _known_models():
+        _push(m)
+    for m in (FALLBACK_MODELS or []):
+        _push(m)
+    _push(_cfgval("default_model"))
+    _push("kimi-k3.1-pro")
+    _push("kimi-k3-2")
+    return out
+
+
 def _pick_name(name):
-    """把客户端传来的模型名归一：去掉 provider 前缀 / 版本后缀，命中 known_models 才认。"""
-    km = _known_models()
+    """把客户端传来的模型名归一：去掉 provider 前缀 / 版本后缀，命中白名单才认。"""
     t = str(name or "").strip().split("/")[-1].split(":")[-1].strip()
-    return t if t in km else ""
+    return t if t in _model_whitelist() else ""
+
+
+# 模型体检台账的内存缓存（30 秒），别每个请求都去读盘
+_MH_CACHE = {"at": 0.0, "data": {}}
+
+
+def _mh_cached(max_age=30):
+    now = time.time()
+    if now - _MH_CACHE["at"] > max_age:
+        try:
+            _MH_CACHE["data"] = (WM.model_health() if WM is not None else {})
+        except Exception:
+            _MH_CACHE["data"] = {}
+        _MH_CACHE["at"] = now
+    return _MH_CACHE["data"]
+
+
+def _model_known_dead(model, max_age=1800):
+    """台账里最近 30 分钟被确认下线的模型，就别再拿它当入口了。"""
+    model = str(model or "").strip()
+    if not model:
+        return False
+    rec = (_mh_cached().get("models") or {}).get(model)
+    if not isinstance(rec, dict) or rec.get("alive") is not False:
+        return False
+    try:
+        return (time.time() - int(rec.get("at") or 0)) <= float(max_age)
+    except Exception:
+        return False
 
 
 def resolve_model(hdr_model=None, req_model=None):
     """模型归属：面板选定的模型优先（与账号完全无关）；
-    客户端想临时覆盖可带请求头 X-WM-Model: <模型名>，其次才看请求体 model。"""
-    return _pick_name(hdr_model) or _pick_name(_active_model()) or _pick_name(req_model) or DEFAULT_MODEL
+    客户端想临时覆盖可带请求头 X-WM-Model: <模型名>，其次才看请求体 model。
+
+    自愈：面板锁在一个「已被确认下线」的模型上时直接跳过，改用 default_model /
+    fallback_models 里还活着的那个 —— 守护没跑也不会再全员 11102。
+    """
+    hdr = _pick_name(hdr_model)
+    if hdr:
+        return hdr
+    panel = _pick_name(_active_model())
+    if panel and not _model_known_dead(panel):
+        return panel
+    for m in [_pick_name(_cfgval("default_model"))] + \
+             [_pick_name(x) for x in (FALLBACK_MODELS or [])]:
+        if m and not _model_known_dead(m):
+            if panel:
+                try:
+                    _boot_log("模型入口 %s 已确认下线，本次请求改用 %s" % (panel, m))
+                except Exception:
+                    pass
+            return m
+    return _pick_name(req_model) or panel or _default_model()
 
 
 # ---------------------------------------------------------------- 输入精简（slim）
@@ -1000,22 +1081,62 @@ def _note_error(model, err, channel):
                                               (err.message or "")[:120]))
     elif uid and err.http in (401, 403):
         _ledger_update(uid, "invalid", note="鉴权失败：%s" % (err.message or "")[:120])
+    # 模型本身没了（11102 / 404）：不管走哪条通道、哪个号，一律落账 —— 之后 resolve_model
+    # 会主动跳过它，守护和面板也能看到"这模型已经死了"，不再把人往死模型上送。
+    if _is_model_missing(err):
+        model_dead(model, err)
 
 
 # ----------------------------------------------------------------------------
 # P0-1/P0-2 直连通道：真流式 + 无锁并发
 # ----------------------------------------------------------------------------
+def _is_model_missing(err):
+    """上游是不是在说「这个模型没了」：HTTP 404，或者业务码 11102（service info not found）。
+
+    以前只认 404，于是 wm_transport 明明把 11102 标成了 fallbackable，这里照样不降级 ——
+    "客户端填什么模型都报同一个模型不存在"就是这么来的。
+    """
+    if WM is not None:
+        try:
+            if WM.is_model_missing(getattr(err, "code", None), getattr(err, "http", None),
+                                   getattr(err, "message", None)):
+                return True
+        except Exception:
+            pass
+    if str(getattr(err, "code", "") or "").strip() == "11102":
+        return True
+    try:
+        return int(getattr(err, "http", 0) or 0) == 404
+    except Exception:
+        return False
+
+
+def model_dead(model, err):
+    """把「上游确认这个模型没了」记进 model_health.json，并让内存缓存立刻失效。"""
+    if WM is None:
+        return
+    try:
+        WM.note_model_dead(model, code=getattr(err, "code", "") or "",
+                           message=getattr(err, "message", "") or "",
+                           http=getattr(err, "http", None), source="relay")
+    except Exception:
+        pass
+    _MH_CACHE["at"] = 0.0
+
+
 def _model_chain(model):
-    """返回降级链：先主模型，再 config 里配的备用模型（去重、只认已知模型）。"""
-    chain = [model]
-    if not FALLBACK_MODELS:
-        return chain
-    km = _known_models()
-    for m in FALLBACK_MODELS:
+    """返回降级链：先主模型，再 config 里配的备用模型（去重）。
+
+    以前多一道 `name in _known_models()` 过滤，而本机 known_models 是空的，
+    于是 fallback_models 里配什么都进不了链 —— 链路故障时根本没有"备用"可退。
+    现在 _pick_name 已把 fallback_models 纳入白名单，这里只负责去重。
+    """
+    chain = [model] if model else []
+    for m in (FALLBACK_MODELS or []):
         name = _pick_name(m)
-        if name and name in km and name not in chain:
+        if name and name not in chain:
             chain.append(name)
-    return chain
+    return chain or [model]
 
 
 def open_direct(oai_req, hdr_model=None):
@@ -1061,12 +1182,16 @@ def open_direct(oai_req, hdr_model=None):
                              fallbackable=e.fallbackable)
             errors.append(err)
             _note_error(model, err, "direct-open")
-            # 关键修复：429/6004 只说明「这个账号的额度没了」，换模型是把同一个上下文扔给另一个模型，
-            # 上次就是这么把上下文搅坏的（还会顺手把 k3-1/k3-2 这两个同源号模型也烧掉）。
-            # 该换的是账号 —— 由 workmom_guard 看到额度耗尽/6004 后切号。
-            # 只有 404（模型名写错/不存在）才在同一账号内降级到备用模型。
-            if err.http == 404 and model != chain[-1]:
-                continue
+            # 红线不变：429/6004 只说明「这个账号的额度没了」，该换的是账号（workmom_guard 干这活），
+            # 绝不拿备用模型顶 —— 换模型等于把同一个上下文丢给另一个模型，上次就是这么搅坏的，
+            # 还会顺手把 k3-1/k3-2 这对同源模型一起烧掉。
+            # 治本：模型「不存在/已下线」同样该降级。以前只认 404，而上游真实返回的是
+            # HTTP 400 + 业务码 11102（service info not found），于是 fallback_models 形同虚设，
+            # hy4-free 下线那次就成了全链路 11102 死循环。现在 11102 与 404 同罪，并落账。
+            if _is_model_missing(err):
+                model_dead(model, err)
+                if model != chain[-1]:
+                    continue
             raise err
         except Exception as e:
             err = RelayError(http=502, code="direct_error", type="api_error",
@@ -1579,13 +1704,28 @@ class Handler(BaseHTTPRequestHandler):
                 "errors": errs[-10:],
                 **_health_extra(),
             })
+        if path in ("/admin/model_health", "/model_health"):
+            d = dict(_mh_cached(max_age=0) or {})
+            d["current"] = _active_model()
+            rec = (d.get("models") or {}).get(d["current"]) or {}
+            d["current_alive"] = rec.get("alive")
+            d["relay"] = "http://127.0.0.1:%d" % int(_cfgval("relay_port", 18793) or 18793)
+            return self._json(200, d)
         if path in ("/v1/models", "/models"):
             now = int(time.time())
             cur = _active_model()
-            out = [{"id": cur, "object": "model", "created": now, "owned_by": "workmom"}]
-            for m in _known_models():
-                if m != cur:
-                    out.append({"id": m, "object": "model", "created": now, "owned_by": "workmom"})
+            mh = (_mh_cached() or {}).get("models") or {}
+            # 用白名单（known_models ∪ fallback ∪ default ∪ 内置），否则 known_models 为空时
+            # 客户端只看到一个当前模型，想切都没得选。
+            order = [cur] + [m for m in _model_whitelist() if m != cur]
+            out = []
+            for m in order:
+                rec = mh.get(m) or {}
+                item = {"id": m, "object": "model", "created": now, "owned_by": "workmom"}
+                if rec.get("alive") is False:
+                    item["workmom_alive"] = False
+                    item["workmom_note"] = "已被上游下线：%s" % ((rec.get("msg") or rec.get("code") or "11102")[:60])
+                out.append(item)
             return self._json(200, {"object": "list", "data": out})
         return self._json(404, {"error": {"message": "not found: " + path, "type": "invalid_request_error"}})
 
@@ -1603,6 +1743,26 @@ class Handler(BaseHTTPRequestHandler):
                     "/v1/responses", "/responses"):
             _audit_request(path, req,
                            forced=str(self.headers.get("X-WM-Audit") or "").strip() == "1")
+
+        # 手动触发一次「模型体检」：探测当前模型与候选模型是否还活着，已下线就自动回退。
+        # 面板按钮、开机脚本、curl 都能调，参数 {"models":[...], "allow_switch":true}
+        if path in ("/admin/model_check", "/model_check"):
+            t0 = time.time()
+            try:
+                res = WM.refresh_model_health(
+                    models=(req.get("models") or None),
+                    allow_switch=bool(req.get("allow_switch", True)),
+                    reason=str(req.get("reason") or "api"))
+                _MH_CACHE["at"] = 0.0
+                _boot_log("模型体检(手动)：当前 %s → %s，回退 %s，耗时 %dms"
+                          % (res.get("current"),
+                             {True: "存活", False: "已下线", None: "未知"}.get(res.get("current_alive"), "?"),
+                             res.get("switched_to") or "无", int((time.time() - t0) * 1000)))
+                return self._json(200, dict({"ok": True,
+                                             "took_ms": int((time.time() - t0) * 1000)}, **res))
+            except Exception as e:
+                return self._json(500, {"ok": False, "error": "%s: %s"
+                                        % (type(e).__name__, str(e)[:200])})
 
         if path in ("/v1/chat/completions", "/chat/completions"):
             return self.chat(req)
@@ -1978,6 +2138,26 @@ def _quota_entry_live(v):
     return bool(at) and (now - at) <= 1800          # 无 reset 只有 30 分钟
 
 
+def _model_health_summary():
+    """面板与客户端都能直接读的模型体检摘要：当前这个模型到底还活没活。"""
+    d = _mh_cached()
+    models = d.get("models") or {}
+    cur = _active_model()
+    rec = models.get(cur) or {}
+    verds = [m for m, r in models.items() if isinstance(r, dict) and r.get("alive") is False]
+    return {
+        "current": cur,
+        "current_alive": rec.get("alive"),
+        "current_code": rec.get("code") or "",
+        "current_msg": rec.get("msg") or "",
+        "current_checked_at": rec.get("at") or 0,
+        "checked_at": d.get("checked_at") or 0,
+        "reason": d.get("reason") or "",
+        "known_dead": verds,
+        "models": models,
+    }
+
+
 def _health_extra():
     """给 /health、/relay_state 共用的运行时状态块。"""
     with _DIRECT_LOCK:
@@ -2046,6 +2226,7 @@ def _health_extra():
                  "requests": _SLIM_STAT.get("n") or 0,
                  "saved_est_total": _SLIM_STAT.get("saved_est") or 0,
                  "last": _SLIM_STAT.get("last") or {}},
+        "model_health": _model_health_summary(),
         "usage": usage,
     }
 
@@ -2226,12 +2407,12 @@ def main():
         raise SystemExit(1)
     srv.daemon_threads = True
     _boot_log("[relay] %s listening on http://127.0.0.1:%d（当前模型 %s）"
-              % (WM.APP_NAME, port, DEFAULT_MODEL))
+              % (WM.APP_NAME, port, _active_model() or _default_model()))
     _boot_log("[relay] protocols: /v1/chat/completions | /v1/messages | /v1/responses")
     _boot_log("[relay] upstream via CDP %s:%d%s" % (CDP_HOST, CDP_PORT, UPSTREAM_PATH))
     if WT is not None and RS is not None:
         _boot_log("[relay] transport=%s（direct 直连真流式可用，max_concurrency=%d，"
-                  "降级链 %s）" % (TRANSPORT, MAX_CONCURRENCY, FALLBACK_MODELS or [DEFAULT_MODEL]))
+                  "降级链 %s）" % (TRANSPORT, MAX_CONCURRENCY, FALLBACK_MODELS or [_default_model()]))
     else:
         _boot_log("[relay] transport=%s（wm_transport/relay_stream 未就绪，仅 CDP 伪流式）"
                   % TRANSPORT)

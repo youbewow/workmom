@@ -1387,6 +1387,253 @@ def known_models():
     return list(cfg().get("known_models") or [])
 
 
+# ------------------------------------------------------------------ 模型存活自检
+# 起因：hy4-free 被上游下线后，面板把它锁死在 current_model.json 里，于是"填什么模型都
+# 报同一个 11102"，而反代的 fallback_models 形同虚设、守护也毫无知觉。
+# 这里给模型加一份"体检台账"：谁活着、谁已经下线、什么时候查的，全部落盘可见。
+MODEL_HEALTH_FILE = os.path.join(DATA, "model_health.json")
+_MH_LOCK = threading.Lock()
+
+# 上游亲口说"这模型不存在"的痕迹（11102 = service info not found）
+_DEAD_CODES = ("11102",)
+_DEAD_WORDS = ("service info not found", "model not found", "model not exist",
+               "model does not exist", "no such model", "invalid model",
+               "unsupported model", "模型不存在", "模型未找到", "模型不可用")
+
+
+def is_model_missing(code=None, http=None, message=None):
+    """判断一个上游错误是不是「这个模型已经没了」。404 与业务码 11102 同罪。"""
+    c = str(code or "").strip()
+    if c in _DEAD_CODES:
+        return True
+    try:
+        if int(http or 0) == 404:
+            return True
+    except Exception:
+        pass
+    m = str(message or "").lower()
+    return any(w in m for w in _DEAD_WORDS)
+
+
+def _relay_base():
+    try:
+        port = int(cfg().get("relay_port") or 18793)
+    except Exception:
+        port = 18793
+    return "http://127.0.0.1:%d" % port
+
+
+def _mh_load():
+    try:
+        with open(MODEL_HEALTH_FILE, encoding="utf-8") as f:
+            d = json.load(f) or {}
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    if not isinstance(d.get("models"), dict):
+        d["models"] = {}
+    return d
+
+
+def _mh_save(d):
+    try:
+        ensure_dirs()
+        _atomic_write(MODEL_HEALTH_FILE, json.dumps(d, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+def model_health():
+    """读模型体检台账（只读盘，不发请求）。"""
+    with _MH_LOCK:
+        return _mh_load()
+
+
+def model_alive(model, max_age=None):
+    """查缓存里某模型的状态：True 活 / False 已下线 / None 没记录或记录过期猜不出来。"""
+    model = str(model or "").strip()
+    if not model:
+        return None
+    d = model_health()
+    rec = (d.get("models") or {}).get(model)
+    if not isinstance(rec, dict):
+        return None
+    if max_age:
+        try:
+            if time.time() - int(rec.get("at") or 0) > float(max_age):
+                return None
+        except Exception:
+            pass
+    return rec.get("alive")
+
+
+def note_model_dead(model, code="", message="", source="relay", http=None):
+    """反代/守护发现某模型上游已下线时记一笔（同模型 60 秒内只写一次，避免刷盘）。"""
+    model = str(model or "").strip()
+    if not model:
+        return
+    now = int(time.time())
+    with _MH_LOCK:
+        d = _mh_load()
+        cur = d["models"].get(model) or {}
+        try:
+            fresh = now - int(cur.get("at") or 0) < 60
+        except Exception:
+            fresh = False
+        if cur.get("alive") is False and fresh:
+            return
+        d["models"][model] = {"alive": False, "code": str(code or ""), "http": http,
+                              "msg": str(message or "")[:200], "at": now,
+                              "source": source}
+        d["checked_at"] = now
+        _mh_save(d)
+    log("模型 %s 已确认不可用（%s %s）" % (model, code or "", str(message or "")[:80]))
+
+
+def _err_fields(raw):
+    """从上游错误响应里抠出业务码和中文说明。"""
+    code, msg = "", ""
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return "", str(raw or "")[:200]
+    if isinstance(d, dict):
+        e = d.get("error") if isinstance(d.get("error"), dict) else d
+        for k in ("code", "status", "type"):
+            v = e.get(k)
+            if v not in (None, ""):
+                code = str(v)
+                break
+        for k in ("message", "msg", "detail", "error_description"):
+            v = e.get(k)
+            if isinstance(v, str) and v.strip():
+                msg = v.strip()
+                break
+        if not msg and isinstance(e, str):
+            msg = e
+    return code, msg
+
+
+def probe_model(model, timeout=None):
+    """极简探活：走本地反代 + X-WM-Model 头，绕开"面板当前模型"这个入口。
+
+    返回 {"model","alive","http","code","msg","ms","at"}：
+      alive=True  还活着（哪怕被限流，只要能排到队就算活）
+      alive=False 上游明确说这个模型不存在（11102 / 404）
+      alive=None  说不清（反代没起、超时、5xx 之类），别拿它当证据
+    """
+    model = str(model or "").strip()
+    t0 = time.time()
+    out = {"model": model, "alive": None, "http": None, "code": "", "msg": "",
+           "ms": 0, "at": int(time.time())}
+    if not model:
+        out["msg"] = "模型名为空"
+        return out
+    if timeout is None:
+        try:
+            timeout = float(cfg().get("model_probe_timeout") or 45)
+        except Exception:
+            timeout = 45.0
+    body = json.dumps({"model": model,
+                       "messages": [{"role": "user", "content": "ping"}],
+                       "max_tokens": 1, "stream": False}).encode("utf-8")
+    req = urllib.request.Request(_relay_base() + "/v1/chat/completions",
+                                 data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "X-WM-Model": model})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            r.read(4000)
+            out["http"] = r.status
+        out["alive"] = True
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read(4000).decode("utf-8", "replace")
+        except Exception:
+            pass
+        code, msg = _err_fields(raw)
+        out["http"] = e.code
+        out["code"] = code
+        out["msg"] = msg or raw[:200]
+        if is_model_missing(code, e.code, raw):
+            out["alive"] = False
+        elif not out["msg"]:
+            out["msg"] = "HTTP %s" % e.code
+    except Exception as e:
+        out["msg"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+    out["ms"] = int((time.time() - t0) * 1000)
+    return out
+
+
+def refresh_model_health(models=None, allow_switch=True, reason="manual", limit=6):
+    """探测并刷新模型体检台账；当前模型已下线时不声不响地回退到还能用的那个。
+
+    models 为空时按「当前模型 → known_models → default_model → fallback_models」自己排队。
+    allow_switch=False 只体检不换模型（给面板做"切之前先验一下"用）。
+    返回 {"checked_at","current","current_alive","switched_to","results"}
+    """
+    c = cfg()
+    cur = active_model()
+    cands = []
+
+    def _add(m):
+        m = str(m or "").strip().split("/")[-1].strip()
+        if m and m not in cands:
+            cands.append(m)
+
+    _add(cur)
+    if models:
+        for m in models:
+            _add(m)
+    else:
+        for m in (c.get("known_models") or []):
+            _add(m)
+        _add(c.get("default_model"))
+        for m in (c.get("fallback_models") or []):
+            _add(m)
+        _add("kimi-k3.1-pro")
+        _add("kimi-k3-2")
+    if limit and len(cands) > limit:
+        cands = cands[:limit]
+
+    results = [probe_model(m) for m in cands]
+    now = int(time.time())
+    with _MH_LOCK:
+        d = _mh_load()
+        for r in results:
+            d["models"][r["model"]] = {"alive": r["alive"], "code": r["code"],
+                                       "http": r["http"], "msg": (r["msg"] or "")[:200],
+                                       "at": r["at"], "ms": r["ms"], "source": "probe"}
+        d["checked_at"] = now
+        d["reason"] = reason
+        d["current"] = cur
+        d["relay"] = _relay_base()
+        _mh_save(d)
+
+    cur_res = next((r for r in results if r["model"] == cur), None)
+    cur_alive = cur_res["alive"] if cur_res else None
+    switched = ""
+    if allow_switch and cur_alive is False:
+        dflt = str(c.get("default_model") or "").strip()
+        alive = [r["model"] for r in results if r["alive"] is True]
+        pick = dflt if dflt in alive else (alive[0] if alive else "")
+        if pick and pick != cur:
+            set_active_model(pick)
+            switched = pick
+            log("模型自检：%s 已下线，自动回退到 %s（reason=%s）" % (cur, pick, reason))
+        elif not pick:
+            log("模型自检：%s 已下线，但没探到任何可用模型（reason=%s），保持不动" % (cur, reason))
+    elif cur_res:
+        log("模型自检：当前模型 %s %s（reason=%s，%dms）"
+            % (cur, {True: "存活", False: "已下线", None: "状态未知"}.get(cur_alive, "?"),
+               reason, cur_res["ms"]))
+    return {"checked_at": now, "current": cur, "current_alive": cur_alive,
+            "switched_to": switched, "results": results}
+
+
 # ------------------------------------------------------------------ 自检
 if __name__ == "__main__":
     ensure_dirs()

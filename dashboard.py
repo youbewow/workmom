@@ -347,6 +347,9 @@ class App:
         self.btn_login.pack(side="left")
         self.btn_claim = mkbtn(top2, "一键领全部积分", self.claim_all_accounts, GREEN, 12)
         self.btn_claim.pack(side="left", padx=(8, 0))
+        # 手动体检：探一次所有候选模型活没活，已下线的自动回退（也写 model_health.json）
+        self.btn_mcheck = mkbtn(top2, "模型体检", self.check_models_manual, CYAN, 12)
+        self.btn_mcheck.pack(side="left", padx=(8, 0))
         tk.Checkbutton(top2, text="启动时自动领今日积分", variable=self.auto_claim, bg=BG, fg=MUTED,
                        selectcolor=PANEL, activebackground=BG, activeforeground=FG,
                        font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 0))
@@ -415,6 +418,7 @@ class App:
         self.t2.pack(side="left", fill="both", expand=True)
         sb2.pack(side="right", fill="y")
         self.t2.tag_configure("pro", foreground=BLUE)
+        self.t2.tag_configure("dead", foreground=RED)
         self.t2.tag_configure("cur", background="#313244", foreground=CYAN)
 
         # ---------- 状态条 ----------
@@ -639,16 +643,24 @@ class App:
         for m in list(models.keys()):
             if m not in order:
                 order.append(m)
+        # 模型存活台账（data/model_health.json）：谁被上游下线了，表里直接标红，一眼就能看出来
+        try:
+            mh = (WM.model_health() or {}).get("models") or {}
+        except Exception:
+            mh = {}
         for m in order:
             v = models.get(m)
             is_cur = (m == cur_model)
+            rec_mh = mh.get(m) or {}
+            is_dead = (rec_mh.get("alive") is False)
+            label = m + ("（已下线）" if is_dead else "")
             if v:
                 who = "、".join(v["who"][:8]) + ("…" if len(v["who"]) > 8 else "")
-                vals = ("▶" if is_cur else "", m, "%d / %d" % (len(v["who"]), len(ACCOUNTS)),
+                vals = ("▶" if is_cur else "", label, "%d / %d" % (len(v["who"]), len(ACCOUNTS)),
                         who, fmt_credits(v["credit"]), v["count"])
             else:
-                vals = ("▶" if is_cur else "", m, "0 / %d" % len(ACCOUNTS), "没人用过", "—", "0")
-            tags = ["cur"] if is_cur else (["pro"] if "kimi" in m else [])
+                vals = ("▶" if is_cur else "", label, "0 / %d" % len(ACCOUNTS), "没人用过", "—", "0")
+            tags = ["cur"] if is_cur else (["dead"] if is_dead else (["pro"] if "kimi" in m else []))
             iid = self.t2.insert("", "end", values=vals, tags=tuple(tags))
             self.mmodel[iid] = m
 
@@ -793,11 +805,65 @@ class App:
 
     def _model_worker(self, model):
         try:
+            # 切之前先验一次：目标模型要是已被上游下线，就别把人往火坑里送（这次 hy4-free 的教训）
+            self.msgq.put(("bar", "→ 正在校验 %s 还活着没……" % model, YELLOW))
+            try:
+                pr = WM.probe_model(model)
+            except Exception as e:
+                pr = {"alive": None, "msg": "%s: %s" % (type(e).__name__, e), "ms": 0}
+            if pr.get("alive") is False:
+                try:
+                    WM.note_model_dead(model, code=pr.get("code"), message=pr.get("msg"),
+                                       http=pr.get("http"), source="panel")
+                except Exception:
+                    pass
+                self.msgq.put(("model",
+                               "✘ %s 已经不可用了（%s），没切。当前仍是 %s。"
+                               % (model, (pr.get("msg") or pr.get("code") or "")[:100],
+                                  WM.active_model()), RED))
+                return
             WM.set_active_model(model)
-            self.msgq.put(("model", "✔ 模型已切到 %s。当前账号 %s 保持不变，以后换任何账号都还是这个模型。"
-                           % (model, WM.current_account().get("nickname") or WM.current_uid()[:8]), GREEN))
+            hint = {True: "探活通过", None: "探活没拿到确凿结论"}.get(pr.get("alive"), "")
+            self.msgq.put(("model",
+                           "✔ 模型已切到 %s（%s %dms）。当前账号 %s 保持不变，以后换任何账号都还是这个模型。"
+                           % (model, hint, int(pr.get("ms") or 0),
+                              WM.current_account().get("nickname") or WM.current_uid()[:8]), GREEN))
         except Exception as e:
             self.msgq.put(("model", "切模型失败: %s: %s" % (type(e).__name__, e), RED))
+
+    # ---------------------------------------------------------------- 模型体检
+    def check_models_manual(self):
+        if getattr(self, "_mcheck_busy", False):
+            self.set_bar("模型体检还在跑，等它出结果……", YELLOW)
+            return
+        self._mcheck_busy = True
+        self.btn_mcheck.config(state="disabled")
+        self.set_bar("→ 正在逐个探活模型（每个一次 1 token 请求，十几秒）……", YELLOW)
+        threading.Thread(target=self._mcheck_worker, daemon=True).start()
+
+    def _mcheck_worker(self):
+        try:
+            r = WM.refresh_model_health(reason="manual")
+            cur = r.get("current") or ""
+            alive = r.get("current_alive")
+            sw = r.get("switched_to") or ""
+            dead = [x["model"] for x in (r.get("results") or []) if x.get("alive") is False]
+            msg = "模型体检完成：当前 %s %s" % (
+                cur, {True: "存活", False: "已下线", None: "状态未知"}.get(alive, "?"))
+            if sw:
+                msg += "，已自动回退到 %s" % sw
+            if dead:
+                msg += "；已下线：%s" % "、".join(dead)
+            self.msgq.put(("model", msg, GREEN if alive is not False else YELLOW))
+            self.msgq.put(("refresh", "↑ 模型状态已刷新", MUTED))
+        except Exception as e:
+            self.msgq.put(("bar", "模型体检失败: %s: %s" % (type(e).__name__, e), RED))
+        finally:
+            self._mcheck_busy = False
+            try:
+                self.btn_mcheck.config(state="normal")
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- 无感登录
     def start_oauth(self):
@@ -826,6 +892,21 @@ class App:
                     uid = r.get("uid") or ""
                     nm = r.get("nickname") or (uid[:8] if uid else "新号")
                     self.msgq.put(("oauth", "✔ 无感登录成功：%s 已写入账号库（%s）" % (nm, WM.ACCOUNTS_DIR), GREEN))
+                    # 首次登录（新号上来）顺手做一次模型体检：新号往往换了一批可用模型，
+                    # 顺带把「当前模型已下线却还在用」这种事挡在第一步。
+                    self.msgq.put(("bar", "→ 登录完成，顺便验一次模型状态……", YELLOW))
+                    try:
+                        r2 = WM.refresh_model_health(reason="first-login")
+                        cur2 = r2.get("current") or ""
+                        al2 = r2.get("current_alive")
+                        sw2 = r2.get("switched_to") or ""
+                        m2 = "首次登录体检：当前 %s %s" % (
+                            cur2, {True: "存活", False: "已下线", None: "状态未知"}.get(al2, "?"))
+                        if sw2:
+                            m2 += "，已自动回退到 %s" % sw2
+                        self.msgq.put(("model", m2, GREEN if al2 is not False else YELLOW))
+                    except Exception as e:
+                        self.msgq.put(("bar", "模型体检没跑成（不影响登录）：%s" % e, YELLOW))
                     return
             self.msgq.put(("oauth", "授权超时（5 分钟没检测到登录完成）。可以再点一次「+ 无感登录新号」。", YELLOW))
         except Exception as e:
@@ -901,8 +982,9 @@ class App:
             kind, text, color = item[0], item[1], (item[2] if len(item) > 2 else FG)
             if kind == "bar":
                 self.set_bar(text, color or YELLOW)
-            elif kind in ("done", "model"):
-                self.set_bar(text, color or FG)
+            elif kind in ("done", "model", "refresh"):
+                if text:
+                    self.set_bar(text, color or FG)
                 self.busy = False
                 self.busy_model = False
                 done = True

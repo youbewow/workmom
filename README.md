@@ -176,6 +176,9 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 - **双击账号行** = 无感切到那个号（写登录文件 + CDP 刷新页面，**不重启 WorkBuddy**，约 3 秒）
   - 那个号正在限流里，会提示；5 秒内再双击一次 = 强切
 - **双击模型行** = 把全部请求切到这个模型。跟换账号**完全无关**，切完账号还是原来那个号
+  - 0.5.4 起**切之前先探活**：这个模型要是已经被上游下线，会直接提示「✘ 已不可用，没切」，不会让你切进坑里
+- `模型体检`（0.5.4 起）= 当场探一遍当前模型与候选模型还活着没；发现当前模型已被下线会**自动回退**，
+  结果直接弹在状态栏。已下线的模型在模型表里标红并注明「（已下线）」
 - `+ 无感登录新号` = 生成官方 OAuth 链接并打开浏览器，登录完自动入库，全程不打断 WorkBuddy
 - `一键领全部积分` = 给所有号领当日积分（凭证过期会先自动 refresh）
 - `重启 WB(兜底)` = 只有无感切号失败、CDP 不可用时才用，会重启 WorkBuddy
@@ -237,6 +240,7 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 | `slim_merge_system` | `true` | 多条 system 消息合并成一条 |
 | `slim_dedupe_min_chars` | `3000` | 超这个长度的重复段落去重 |
 | `slim_para_min_chars` | `500` | 长段落里的空白/重复换行折叠阈值 |
+| `model_check_secs` | `1800` | 模型存活自检间隔（0.5.4）：守护每隔这么久探一次模型死活，当前模型下线就自动回退；设为 `0` 关闭周期自检（启动那次仍会跑） |
 
 改完不需要重装，重启反代生效：`stop_all.bat` 后双击桌面 `workmom`。
 
@@ -254,7 +258,9 @@ python setup.py --no-shortcut  # 不建桌面快捷方式
 - `GET /relay_state` —— 运行状态（守护只读消费，零额外 token）。0.5.2 起带全账号额度明细：
   `uid`（当前有效号）/ `quotas_by_uid`（`{uid: {model: {percent, reset_at, at}}}`，面板靠它逐行显示「额度已用」）/
   `last_pro_6004_uid`（最近一次撞 6004 的是哪个号）
-- `GET /v1/models` —— OpenAI 格式模型列表
+- `GET /v1/models` —— OpenAI 格式模型列表（0.5.4 起走白名单，已下线的带 `workmom_alive:false` 与原因）
+- `GET /admin/model_health`（别名 `/model_health`）—— 模型存活台账，0.5.4 起
+- `POST /admin/model_check`（别名 `/model_check`）—— 手动模型体检，0.5.4 起，详见「六·五」
 - `POST /v1/chat/completions` —— OpenAI Chat 协议，`model` 字段留空则用当前模型
 - `POST /v1/messages` —— Anthropic Messages 协议（Claude Code 等）
 - `POST /v1/messages/count_tokens` —— Anthropic token 估算（本地算，不耗额度）
@@ -381,10 +387,77 @@ python workmom_guard.py --quota-check
 附带两个体验修正：面板默认置顶（`-topmost`，构造期设置的会被 Tk 丢掉，所以映射完成后补设一次），
 手动刷新会写 `data/panel_actions.log` 并在状态栏回执「手动第 N 次 · 耗时 X.XXs」，按钮点击期间显示「刷新中…」并禁用。
 
+## 六·五、模型存活管理（0.5.4 起）
+
+### 为什么要有这个
+
+上游会**把模型下线**。`hy4-free` 被下线那次，面板里 `current_model.json` 还钉着它，而 `resolve_model()`
+把面板模型排在最高优先级 —— 于是客户端**请求体里填什么模型都无效**（被静默覆盖），一律 400 / `11102`。
+链路完全正常，入口锁死在一个不存在的模型上，重启多少次都没用：
+
+- `wm_transport` 早把 11102 标成 `fallbackable=True`，但 `server.py` 的降级判定只认 `http == 404`，降级链走不到；
+- `DEFAULT_MODEL` 是 import 期冻结的常量，配置改了它也不变；
+- `_model_chain()` 还多一道 `in _known_models()` 过滤，`known_models` 为空时降级链永远只有主模型；
+- 守护、面板都没有"模型还活着吗"这个概念，人能随手切到一个已下线的模型上。
+
+0.5.4 起把**模型当资源管**：模型也有"活 / 死"，死了要记账、要跳过、要能自动回退。
+
+### 判死的标准
+
+| 信号 | 判定 |
+| --- | --- |
+| HTTP 404 | 已下线 |
+| 上游业务码 `11102`（`model not exist` / `service info not found`） | 已下线 |
+| 文案含 `model not exist` / `模型不存在` / `未接入` 等 | 已下线（兜底） |
+| HTTP 429 / 业务码 `6004` | **不是** 模型问题 → 只换账号，**绝不换模型**（红线不变） |
+
+### 台账与接口
+
+- 台账文件：`data/model_health.json`，记录每个模型 `alive` / `code` / `msg` / `checked_at` / `source`。
+- `GET /admin/model_health`（别名 `/model_health`）：只读台账全量 + 当前模型存活结论。
+- `POST /admin/model_check`：**手动体检**，body 可带 `{"models":[...], "allow_switch":true, "reason":"..."}`；
+  不带参数就探「当前模型 + 白名单 + 降级链」，当前模型已死会自动回退。
+- `/health`、`/relay_state` 里内嵌 `model_health` 摘要（`current` / `current_alive` / `known_dead`）。
+- `/v1/models` 改用白名单（`known_models` ∪ `fallback_models` ∪ `default_model` ∪ 内置），
+  已下线的模型带 `"workmom_alive": false` 与原因，客户端一眼看出该切谁。
+
+### 三个刷新时机（这次的主要新增）
+
+| 时机 | 触发 | 行为 |
+| --- | --- | --- |
+| **首次登录后** | 面板「+ 无感登录新号」成功 | 自动跑一次模型体检，结果弹在状态栏；发现当前模型下线会直接回退 |
+| **手动** | 面板「模型体检」按钮 / `python workmom_guard.py --model-check` / `POST /model_check` | 同上；`--no-switch` 或 `allow_switch:false` 只探不切 |
+| **周期 + 启动** | 守护主循环第 6 步（`model_check_secs`，默认 1800 秒）；**每次启动必探一次** | 存活只记日志；确认下线 → 自动回退到备用模型 + 写告警 |
+
+面板侧还有两道闸：**切模型前先探活，已下线直接拒绝**（提示「✘ 已不可用，没切」）；
+模型表里已下线的模型标红并注明「（已下线）」。
+
+### 常用命令
+
+```bat
+:: 只探不切（安全，看一眼就走）
+python workmom_guard.py --model-check --no-switch
+
+:: 探 + 自动回退（当前模型死了才动手）
+python workmom_guard.py --model-check
+
+:: 走反代接口（反代在跑时）
+curl -s -X POST http://127.0.0.1:18793/model_check -H "Content-Type: application/json" -d "{\"allow_switch\":true}"
+curl -s http://127.0.0.1:18793/admin/model_health
+```
+
+`--model-check` 退出码：`0` = 当前模型存活，`2` = 当前模型已下线（方便接进开机脚本/监控）。
+
 ## 七、排障
 
 | 现象 | 先看哪 |
 | --- | --- |
+| 反代活着、`/health` 也 ok，但请求一律 400 / `11102 model not exist`，填什么模型都一样 | 面板模型被锁在一个已下线的模型上（`resolve_model` 面板优先级最高，请求体会被覆盖）。跑 `python workmom_guard.py --model-check`，它会告诉你当前模型死没死并自动回退；或临时加 `X-WM-Model: kimi-k3.1-pro` 头验证链路本身是好的 |
+| 面板能点「切模型」，切完照样 11102 | 0.5.4 起切之前会先探活，已下线会直接拒绝并提示「✘ 已不可用，没切」。若还能切过去，说明跑的是旧进程，`stop_all.bat` 后重起 |
+| 想看某模型到底什么时候被判死的 | `data/model_health.json`（`checked_at` 是 unix 秒）；或 `GET /admin/model_health` |
+| 模型表里一列都标红「（已下线）」 | 上游整批下线 / key 失效。看 `/health` 的 `transport`、`upstream_base`，以及 `relay.err.log` 最近的错误码 |
+| 想让它检查得更勤 | `config.json` 加 `"model_check_secs": 600`（默认 1800 秒）；改完重启守护 |
+
 | 客户端只报「原因暂不明确」/「未知错误」，看不出是不是额度 | 0.4.x 的老问题（上游 429 被兜成空 502）。0.5.0 起已改成结构化 429，可直接看到 `code 6004` + 重置时间。若还看到空 body：`curl -s -i -X POST http://127.0.0.1:18793/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"kimi-k3.1-pro\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"` 亲眼确认状态码与 body；仍是 502 说明跑的还是旧进程，`stop_all.bat` 后重起 |
 | 明明上游限流了，反代却像「没发生」 | 这是降级在起作用：反代按 `fallback_models` 自动换到下一个没用满的模型，客户端拿到的是 200。想确认当下真实状态看 `GET /`（Web 面板「限流冷却」区块）或 `/health` 里的 `cooldowns` / `pro_6004` 计数 |
 | 只有部分请求能出字、偶发卡死，重启 WorkBuddy 就好 | 渲染进程主线程卡死的典型症状。0.5.0 起有看门狗：`/health` 的 `cdp_health` 里看 `ok` / `fail_streak` / `last_err`；`auto_heal=report` 只上报，想让它自动重启 WorkBuddy 就改 `auto_heal=restart`（连续 2 次探活失败且直连 5 分钟没成功才动手） |

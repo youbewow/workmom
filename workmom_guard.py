@@ -899,6 +899,37 @@ def probe_quota(cfg, uid, model, ttl=PROBE_TTL, dry=False):
 
 
 _SWEEPING = False
+_MCHECKING = False
+
+
+def model_check_once(cfg, allow_switch=True, reason="guard"):
+    """探一次「模型还活着没」。
+
+    这次 hy4-free 被上游下线的教训：面板把 current_model.json 钉死在一个已经不存在的模型上，
+    反代照旧拿它当入口，请求一律 400/11102，谁都不知道到底怎么了。
+    所以守护每隔一段（以及每次启动）就探一次；当前模型确认下线 → 自动回退到 default_model
+    或降级链里第一个还活着的模型，并把告警写进日志与 data/model_health.json。
+    """
+    out = {"ok": False, "current": "", "current_alive": None, "switched_to": "", "results": []}
+    try:
+        out = WM.refresh_model_health(allow_switch=bool(allow_switch), reason=reason) or out
+    except Exception as e:
+        log("模型自检异常: %s: %s" % (type(e).__name__, e))
+        return out
+    cur = out.get("current") or ""
+    alive = out.get("current_alive")
+    sw = out.get("switched_to") or ""
+    dead = [x.get("model") for x in (out.get("results") or []) if x.get("alive") is False]
+    if alive is False:
+        log("!! 当前模型 %s 已被上游下线（%s），%s" %
+            (cur, (out.get("current_msg") or out.get("current_code") or "11102")[:80],
+             ("已自动回退到 %s" % sw) if sw else
+             ("本次只探不切（--no-switch）" if not allow_switch else "没有可用替代，需人工处理")))
+    else:
+        log("模型自检：当前 %s %s%s" %
+            (cur, {True: "存活", None: "状态未知"}.get(alive, "?"),
+             ("；已下线 %s" % "、".join([d for d in dead if d]) if dead else "")))
+    return out
 
 
 def sweep_quotas(cfg, rs=None):
@@ -1146,6 +1177,22 @@ def main():
         ok = switch_next(cfg, st, reason="manual", dry=dry)
         return 0 if ok else 1
 
+    # 手动模型自检：python workmom_guard.py --model-check
+    # 加 --no-switch 则只探不切（只看结论）。面板的「模型体检」按钮走的是同一套逻辑。
+    if "--model-check" in args:
+        log("手动模型自检（reason=cli%s）" % ("，只探不切" if "--no-switch" in args else ""))
+        r = model_check_once(cfg, allow_switch="--no-switch" not in args,
+                             reason="cli" + ("-probe-only" if "--no-switch" in args else ""))
+        print("当前模型: %s" % (r.get("current") or "?"))
+        print("存活判定: %s" % {True: "存活", False: "已下线", None: "未知"}.get(r.get("current_alive"), "?"))
+        if r.get("switched_to"):
+            print("已自动回退到: %s" % r["switched_to"])
+        for x in (r.get("results") or []):
+            print("  - %-24s %s %dms" % (x.get("model") or "?",
+                                         {True: "存活", False: "已下线", None: "未知"}.get(x.get("alive"), "?"),
+                                         int(x.get("ms") or 0)))
+        return 0 if r.get("current_alive") is not False else 2
+
     if already_running():
         log("已有守护进程在跑（%s），退出" % LOCK_FILE)
         return 0
@@ -1153,6 +1200,10 @@ def main():
     log("======== 自动切号守护启动 pid=%d ========" % os.getpid())
     log("队列 %d 个号，轮询 %ss，冷却 %ss" % (len(cfg["queue"]),
                                         cfg["poll_interval"], cfg["cooldown"]))
+    # 每次启动先把自检时间清零 → 首轮循环必然探一次模型，
+    # 「人手动切到已下线模型 + 重启守护/机器」这种场景，开机就把坑填了。
+    st["last_model_check_at"] = 0
+    save_state(st)
 
     handled = st.get("handled_6004_at") or 0
     try:
@@ -1303,6 +1354,33 @@ def main():
                             _SWEEPING = False
 
                     threading.Thread(target=_sweep_bg, daemon=True).start()
+
+            # 6) 模型存活自检 —— 面板把 current_model 钉在一个已被上游下线的模型上时（hy4-free 那次），
+            #    反代会一直吐 11102。这里定期探一次，还活着就啥也不干，死了就自动回退并告警。
+            if not dry and rs is not None:
+                mc_raw = cfg.get("model_check_secs")
+                try:
+                    mc_gap = 1800.0 if mc_raw is None else float(mc_raw)
+                except Exception:
+                    mc_gap = 1800.0
+                global _MCHECKING
+                if (mc_gap > 0
+                        and time.time() - (st.get("last_model_check_at") or 0) >= mc_gap
+                        and not _MCHECKING):
+                    _MCHECKING = True
+                    st["last_model_check_at"] = time.time()
+                    save_state(st)
+
+                    def _mcheck_bg(c=cfg):
+                        global _MCHECKING
+                        try:
+                            model_check_once(c, allow_switch=True, reason="periodic")
+                        except Exception as e:
+                            log("模型自检异常: %s: %s" % (type(e).__name__, e))
+                        finally:
+                            _MCHECKING = False
+
+                    threading.Thread(target=_mcheck_bg, name="wm-mcheck", daemon=True).start()
 
             if "--once" in args:
                 break

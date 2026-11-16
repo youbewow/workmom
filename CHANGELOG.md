@@ -1,5 +1,54 @@
 # 更新记录
 
+## 0.5.4 — 2026-11-17
+
+**模型被上游下线，程序却当它还活着：11102 不降级、面板能切死模型、没有存活自检**
+
+上游把 `hy4-free` 下线之后，面板 `current_model.json` 里还钉着它。`resolve_model` 把面板模型排在
+最高优先级，于是**请求体里填什么模型都没用**（被静默覆盖），一律 400 / `11102 model not exist`；
+而 `wm_transport` 早把 11102 标成 `fallbackable=True`，`server.py` 的降级判定却只认 `http == 404`，
+`fallback_models` 形同虚设；守护那边也没有任何"模型还活着吗"的概念。结果就是：链路完全正常，
+入口却锁死在一个不存在的模型上，重启多少次都一样。
+
+- 现象：反代「活着但不出字」，`relay.err.log` 里刷满 11102；只有手动加 `X-WM-Model: kimi-k3.1-pro`
+  头才 200。面板上看不出任何异常。
+- 根因四处：
+  1. `server.py` 降级判定 `if err.http == 404 and model != chain[-1]` —— 上游业务码 11102 走不到降级；
+  2. `DEFAULT_MODEL` 是 **import 期冻结** 的常量，进程起来后配置怎么改它都不变；
+  3. `_model_chain()` 多一道 `name in _known_models()` 过滤，本机 `known_models` 为空 → 降级链永远只有主模型；
+  4. 面板切模型只写盘、不探活，人能随手切到一个已经下线的模型上，而且没有任何机制发现这件事。
+- 现在：**模型也算一种会被上游拿走的资源，按"存活"来管**。
+  - `workmom_core.py` 新增模型健康台账 `data/model_health.json`：
+    `is_model_missing(code,http,msg)`（404 与 11102 同罪 + 文案兜底）、
+    `probe_model(model,timeout)`（走本地反代 + `X-WM-Model` 头 + `max_tokens=1`，只要一个 token 就够判生死）、
+    `refresh_model_health(...)`（排队 当前模型 → known_models → default_model → fallback_models → 内置；
+    **当前模型确认下线时自动回退** 到第一个存活者并落盘）、`note_model_dead()`（60s 内同模型只记一次）。
+  - `server.py`：
+    - 删掉冻结的 `DEFAULT_MODEL`，改 `_default_model()` 惰性求值；
+    - `_model_chain()` 只做归一 + 去重，**`fallback_models` 真的能进链**；
+    - 新增 `_is_model_missing()` / `model_dead()`，`open_direct` 里 `404 → 11102` 都可降级并落账；
+      **红线不变：429 / 6004 只换账号、绝不换模型**；
+    - `resolve_model()` 会跳过 `30 分钟` 内已知下线的模型（面板模型死了自动跳到存活者）；
+    - `_note_error()` 增加兜底落账 —— 不管走哪条通道、哪个号，11102/404 一律记账；
+    - 新增 `GET /admin/model_health`（别名 `/model_health`）只读台账、`POST /admin/model_check`
+      （别名 `/model_check`）手动体检；`/health`、`/relay_state` 内嵌 `model_health` 摘要；
+    - `/v1/models` 改用白名单，已下线的模型带 `workmom_alive:false` 与原因，客户端能看见该切谁。
+  - `workmom_guard.py`：
+    - 新增 `model_check_once()`：告警写日志（「当前模型 X 已被上游下线（11102），已自动回退到 Y」）；
+    - 主循环第 6 步周期自检（`model_check_secs`，默认 1800 秒），后台线程 + `_MCHECKING` 防重入；
+    - **每次启动把 `last_model_check_at` 清零 → 开机/重启必然先探一次**；
+    - 新增 CLI：`python workmom_guard.py --model-check [--no-switch]`，退出码 0=存活 / 2=已下线。
+  - `dashboard.py`：
+    - 新增「模型体检」按钮（`check_models_manual`）；
+    - **切模型前先 `probe_model`，已下线直接拒绝**（提示「✘ 已不可用，没切」），不再让人误切；
+    - **无感登录成功（首次登录）后自动刷一次模型状态**，结果直接弹在状态栏；
+    - 模型表里已下线的模型标红并注明「（已下线）」。
+- 实测（本次修完当场验证）：
+  - `--model-check --no-switch`：`hy4-free` 判定已下线（400ms / 11102），其余 5 个模型全部存活；
+  - `--model-check`：自动把 `current_model.json` 从 `hy4-free` 回退到 `kimi-k3.1-pro`（`updated_at` 同步刷新）；
+  - 重启反代后默认入口（不带头）实测 **HTTP 200、`model: kimi-k3.1-pro`、正常出字**；
+  - `X-WM-Model: hy4-free` 不再把反代拖进 11102 死循环，降级链接手。
+
 ## 0.5.3 — 2026-11-14
 
 **旧额度快照冒充当下：好号被误判「额度耗尽」、反代还把它塞给客户端**
