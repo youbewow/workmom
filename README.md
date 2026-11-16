@@ -409,7 +409,25 @@ python workmom_guard.py --quota-check
 | HTTP 404 | 已下线 |
 | 上游业务码 `11102`（`model not exist` / `service info not found`） | 已下线 |
 | 文案含 `model not exist` / `模型不存在` / `未接入` 等 | 已下线（兜底） |
+| 探活回 200 但**实际干的不是它**（被降级接走） | 已下线（`code:fallback`） |
 | HTTP 429 / 业务码 `6004` | **不是** 模型问题 → 只换账号，**绝不换模型**（红线不变） |
+
+> **0.5.4 补丁要点：200 不等于活着。** 探活本身是走本机反代发出去的，而反代这版开始会降级 ——
+> 拿一个已死的模型去探，反代会偷偷换成活的再回 200，光看状态码就会把它判成「活着」，白修一场。
+> 所以判活一律以**实际返回的模型名**为准：响应体 `model`（或响应头 `X-WM-Model-Used`）与探测名
+> 不一致，即判死，备注`请求被静默降级到 X（本模型不可用）`。
+
+### 客户端怎么知道被偷换了
+
+反代成功响应会回显真正干活的模型：
+
+| 响应头 | 含义 |
+| --- | --- |
+| `X-WM-Model-Used` | 这一轮**实际**使用的模型（被降级后是降级后的那个） |
+| `X-WM-Model-Fallback: 1` | 出现过「点名 A、实际用 B」，即中途被降级 |
+
+两个头都在 CORS `Access-Control-Expose-Headers` 里，浏览器端也读得到。客户端想确认自己点名的模型
+到底有没有被满足，看 `X-WM-Model-Used` 就行，不用再靠猜。
 
 ### 台账与接口
 
@@ -419,7 +437,8 @@ python workmom_guard.py --quota-check
   不带参数就探「当前模型 + 白名单 + 降级链」，当前模型已死会自动回退。
 - `/health`、`/relay_state` 里内嵌 `model_health` 摘要（`current` / `current_alive` / `known_dead`）。
 - `/v1/models` 改用白名单（`known_models` ∪ `fallback_models` ∪ `default_model` ∪ 内置），
-  已下线的模型带 `"workmom_alive": false` 与原因，客户端一眼看出该切谁。
+  **每一条都带明确状态**：`workmom_alive` 为 `true`（存活）/ `false`（已下线，附 `workmom_note` 原因）
+  / `null`（尚未体检，注「状态未知」），另有 `workmom_checked_at` 体检时间。客户端一眼看出该切谁。
 
 ### 三个刷新时机（这次的主要新增）
 
@@ -457,6 +476,9 @@ curl -s http://127.0.0.1:18793/admin/model_health
 | 想看某模型到底什么时候被判死的 | `data/model_health.json`（`checked_at` 是 unix 秒）；或 `GET /admin/model_health` |
 | 模型表里一列都标红「（已下线）」 | 上游整批下线 / key 失效。看 `/health` 的 `transport`、`upstream_base`，以及 `relay.err.log` 最近的错误码 |
 | 想让它检查得更勤 | `config.json` 加 `"model_check_secs": 600`（默认 1800 秒）；改完重启守护 |
+| 探活回 200，`model_health` 里却记成「已下线 / 请求被静默降级到 X」 | **这是正常的，也是对的**。反代自己会降级，拿死模型去探必然拿到别人回的 200；判死看的是实际模型名而不是状态码，别被 200 骗了 |
+| 客户端说「我明明点名了 A，感觉回答不对/模型是老的」 | 看响应头 `X-WM-Model-Used` 与 `X-WM-Model-Fallback`：有 `Fallback: 1` 就是中途被降级接走了，实际干活的模型在 `X-WM-Model-Used` 里 |
+| 台账里同一个模型出现两条 / 状态来回跳 | 0.5.4 补丁起台账带文件锁（`data/model_health.lock`），三个进程并发写不再互相覆盖；若还有异常，删 `data/model_health.json` 重新体检一次即可（只丢历史，不丢配置） |
 
 | 客户端只报「原因暂不明确」/「未知错误」，看不出是不是额度 | 0.4.x 的老问题（上游 429 被兜成空 502）。0.5.0 起已改成结构化 429，可直接看到 `code 6004` + 重置时间。若还看到空 body：`curl -s -i -X POST http://127.0.0.1:18793/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"kimi-k3.1-pro\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"` 亲眼确认状态码与 body；仍是 502 说明跑的还是旧进程，`stop_all.bat` 后重起 |
 | 明明上游限流了，反代却像「没发生」 | 这是降级在起作用：反代按 `fallback_models` 自动换到下一个没用满的模型，客户端拿到的是 200。想确认当下真实状态看 `GET /`（Web 面板「限流冷却」区块）或 `/health` 里的 `cooldowns` / `pro_6004` 计数 |

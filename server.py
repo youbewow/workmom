@@ -498,6 +498,16 @@ def _pick_name(name):
 _MH_CACHE = {"at": 0.0, "data": {}}
 
 
+def _norm(name):
+    """模型名归一：去空白、去 provider 前缀，和 core 台账保持同一套键。"""
+    try:
+        if WM is not None and hasattr(WM, "_norm_model"):
+            return WM._norm_model(name)
+    except Exception:
+        pass
+    return str(name or "").strip().split("/")[-1].strip()
+
+
 def _mh_cached(max_age=30):
     now = time.time()
     if now - _MH_CACHE["at"] > max_age:
@@ -514,7 +524,7 @@ def _model_known_dead(model, max_age=1800):
     model = str(model or "").strip()
     if not model:
         return False
-    rec = (_mh_cached().get("models") or {}).get(model)
+    rec = (_mh_cached().get("models") or {}).get(_norm(model))
     if not isinstance(rec, dict) or rec.get("alive") is not False:
         return False
     try:
@@ -1546,7 +1556,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Expose-Headers",
-                         "X-WM-Quota-Percent,X-WM-Quota-Reset,X-WM-Quota-Model,X-WM-Quota-Near-Limit")
+                         "X-WM-Quota-Percent,X-WM-Quota-Reset,X-WM-Quota-Model,X-WM-Quota-Near-Limit,"
+                         "X-WM-Model-Used,X-WM-Model-Fallback")
         for k, v in _quota_headers(extra_headers).items():
             self.send_header(k, str(v))
         self.end_headers()
@@ -1720,11 +1731,18 @@ class Handler(BaseHTTPRequestHandler):
             order = [cur] + [m for m in _model_whitelist() if m != cur]
             out = []
             for m in order:
-                rec = mh.get(m) or {}
+                rec = mh.get(_norm(m)) or {}
                 item = {"id": m, "object": "model", "created": now, "owned_by": "workmom"}
-                if rec.get("alive") is False:
-                    item["workmom_alive"] = False
+                # 每条都给一个明确结论：True 活着 / False 已下线 / None 还没查过。
+                # 客户端（含 agent）据此判断能不能选，不用再猜。
+                alive = rec.get("alive")
+                item["workmom_alive"] = bool(alive) if alive is not None else None
+                if rec.get("at"):
+                    item["workmom_checked_at"] = rec.get("at")
+                if alive is False:
                     item["workmom_note"] = "已被上游下线：%s" % ((rec.get("msg") or rec.get("code") or "11102")[:60])
+                elif alive is None:
+                    item["workmom_note"] = "尚未体检，状态未知"
                 out.append(item)
             return self._json(200, {"object": "list", "data": out})
         return self._json(404, {"error": {"message": "not found: " + path, "type": "invalid_request_error"}})
@@ -1890,12 +1908,18 @@ class Handler(BaseHTTPRequestHandler):
             return True, None
 
         # 非流式响应体按协议构造
+        # used = 这一轮真正干活的模型（循环变量 model 会在降级时被改写）；
+        # client_model = 一开始想要的那个。两者不一致就说明中途换过模型，必须让客户端看见。
+        used = str(model or client_model or "")
+        hd = {"X-WM-Model-Used": used}
+        if used and client_model and _norm(used) != _norm(client_model):
+            hd["X-WM-Model-Fallback"] = "1"
         if protocol == "anthropic":
-            self._json(200, RP.openai_to_anthropic(res, model))
+            self._json(200, RP.openai_to_anthropic(res, model), hd)
         elif protocol == "responses":
-            self._json(200, RP.openai_to_responses(res, model))
+            self._json(200, RP.openai_to_responses(res, model), hd)
         else:
-            self._json(200, _openai_completion_body(res, model, client_model))
+            self._json(200, _openai_completion_body(res, model, client_model), hd)
         return True, None
 
     # -- OpenAI Chat Completions（原生） -------------------------------------

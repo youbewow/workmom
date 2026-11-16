@@ -16,6 +16,7 @@ workmom core  —— WorkBuddy 账号/模型控制核心（纯自研，不依赖
 """
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -1392,6 +1393,7 @@ def known_models():
 # 报同一个 11102"，而反代的 fallback_models 形同虚设、守护也毫无知觉。
 # 这里给模型加一份"体检台账"：谁活着、谁已经下线、什么时候查的，全部落盘可见。
 MODEL_HEALTH_FILE = os.path.join(DATA, "model_health.json")
+MODEL_HEALTH_LOCK = os.path.join(DATA, "model_health.lock")
 _MH_LOCK = threading.Lock()
 
 # 上游亲口说"这模型不存在"的痕迹（11102 = service info not found）
@@ -1444,6 +1446,75 @@ def _mh_save(d):
         pass
 
 
+@contextlib.contextmanager
+def _mh_file_lock(timeout=3.0):
+    """跨进程锁：反代 / 守护 / 面板三方都会写同一份台账，光靠线程锁会互相盖掉。
+
+    用 sidecar 锁文件 + 建议锁（Windows 走 msvcrt，其它平台走 fcntl）。
+    超时也放行，宁可偶发不串行，也不要把调用方卡死。
+    """
+    ensure_dirs()
+    f = None
+    locked = False
+    try:
+        f = open(MODEL_HEALTH_LOCK, "a+b")
+        deadline = time.time() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except Exception:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.02)
+    except Exception:
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+            f = None
+    try:
+        yield
+    finally:
+        if f is not None:
+            if locked:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def _mh_update(fn):
+    """读-改-写台账：进程内线程锁 + 跨进程文件锁双保险。fn(d) 返回 False 表示不用写盘。"""
+    with _MH_LOCK:
+        with _mh_file_lock():
+            d = _mh_load()
+            if fn(d) is False:
+                return d
+            _mh_save(d)
+            return d
+
+
+def _norm_model(name):
+    """模型名归一：去空白、去 provider 前缀，避免台账里出现两个看起来一样的键。"""
+    return str(name or "").strip().split("/")[-1].strip()
+
 def model_health():
     """读模型体检台账（只读盘，不发请求）。"""
     with _MH_LOCK:
@@ -1470,24 +1541,26 @@ def model_alive(model, max_age=None):
 
 def note_model_dead(model, code="", message="", source="relay", http=None):
     """反代/守护发现某模型上游已下线时记一笔（同模型 60 秒内只写一次，避免刷盘）。"""
-    model = str(model or "").strip()
+    model = _norm_model(model)
     if not model:
         return
     now = int(time.time())
-    with _MH_LOCK:
-        d = _mh_load()
+
+    def _apply(d):
         cur = d["models"].get(model) or {}
         try:
             fresh = now - int(cur.get("at") or 0) < 60
         except Exception:
             fresh = False
         if cur.get("alive") is False and fresh:
-            return
+            return False
         d["models"][model] = {"alive": False, "code": str(code or ""), "http": http,
                               "msg": str(message or "")[:200], "at": now,
                               "source": source}
         d["checked_at"] = now
-        _mh_save(d)
+        return True
+
+    _mh_update(_apply)
     log("模型 %s 已确认不可用（%s %s）" % (model, code or "", str(message or "")[:80]))
 
 
@@ -1526,7 +1599,7 @@ def probe_model(model, timeout=None):
     model = str(model or "").strip()
     t0 = time.time()
     out = {"model": model, "alive": None, "http": None, "code": "", "msg": "",
-           "ms": 0, "at": int(time.time())}
+           "ms": 0, "at": int(time.time()), "used": ""}
     if not model:
         out["msg"] = "模型名为空"
         return out
@@ -1545,9 +1618,30 @@ def probe_model(model, timeout=None):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as r:
-            r.read(4000)
             out["http"] = r.status
-        out["alive"] = True
+            used = ""
+            body_txt = ""
+            try:
+                body_txt = r.read(8000).decode("utf-8", "replace")
+            except Exception:
+                body_txt = ""
+            try:
+                used = str((json.loads(body_txt) or {}).get("model") or "").strip()
+            except Exception:
+                used = ""
+            if not used:
+                # 没回显就看响应头（0.5.4 起反代会带 X-WM-Model-Used）
+                used = str(r.headers.get("X-WM-Model-Used") or "").strip()
+        out["used"] = used
+        if used and _norm_model(used) != _norm_model(model):
+            # 反代自己能降级，死了的模型也会被它偷偷换成别人再回 200。
+            # 所以"200"不等于"这个模型活着"，必须核对实际用的到底是不是它。
+            out["alive"] = False
+            out["code"] = "fallback"
+            out["msg"] = "请求被静默降级到 %s（本模型不可用）" % used
+        else:
+            out["alive"] = True
+            out["used"] = used or model
     except urllib.error.HTTPError as e:
         raw = ""
         try:
@@ -1601,17 +1695,19 @@ def refresh_model_health(models=None, allow_switch=True, reason="manual", limit=
 
     results = [probe_model(m) for m in cands]
     now = int(time.time())
-    with _MH_LOCK:
-        d = _mh_load()
+    def _apply(d):
         for r in results:
-            d["models"][r["model"]] = {"alive": r["alive"], "code": r["code"],
-                                       "http": r["http"], "msg": (r["msg"] or "")[:200],
-                                       "at": r["at"], "ms": r["ms"], "source": "probe"}
+            d["models"][_norm_model(r["model"])] = {
+                "alive": r["alive"], "code": r["code"], "http": r["http"],
+                "msg": (r["msg"] or "")[:200], "at": r["at"], "ms": r["ms"],
+                "source": "probe"}
         d["checked_at"] = now
         d["reason"] = reason
         d["current"] = cur
         d["relay"] = _relay_base()
-        _mh_save(d)
+        return True
+
+    _mh_update(_apply)
 
     cur_res = next((r for r in results if r["model"] == cur), None)
     cur_alive = cur_res["alive"] if cur_res else None

@@ -49,6 +49,34 @@
   - 重启反代后默认入口（不带头）实测 **HTTP 200、`model: kimi-k3.1-pro`、正常出字**；
   - `X-WM-Model: hy4-free` 不再把反代拖进 11102 死循环，降级链接手。
 
+### 0.5.4 补丁 — 同日晚（探活的"自欺陷阱"与三处收口）
+
+第一版修完当晚就翻出一个更阴的坑：**探测自己是走本机反代做的，而反代这版开始会降级了**。
+拿 `hy4-free` 去探，反代发现它死了 → 偷偷换成 `kimi-k3.1-pro` → 回 200 出字 →
+探测端看见 200 就当它活着，台账又把它标回 `alive:true`，`resolve_model` 于是继续放行。
+一句话：**修好降级之后，"200"就不再等于"这个模型活着"了**。
+
+- 根因：`probe_model` 只看 HTTP 状态码，不看**到底哪个模型在干活**。
+- 修法：判活改成核对实际模型名，而不是看状态码。
+  1. `probe_model` 读响应体 `model`（或响应头 `X-WM-Model-Used`），
+     与探测名不一致 → `alive:false`、`code:"fallback"`、备注「请求被静默降级到 X（本模型不可用）」；
+  2. 反代成功响应统一回显实际模型：新增 `X-WM-Model-Used`，被换过再加 `X-WM-Model-Fallback: 1`，
+     并加进 CORS `Access-Control-Expose-Headers`；基准用「客户端点名或面板当前」（`client_model`），
+     不是上游回显的入参名（那个永远是请求里写的）；
+  3. 台账加跨进程文件锁 `data/model_health.lock`（Windows `msvcrt.LK_NBLCK`，抢不到超时也放行），
+     `_mh_update()` 线程锁 + 文件锁双保险，反代/守护/面板三个进程同时写不再互相覆盖；
+  4. `/v1/models` 每条都给明确状态：`workmom_alive` 为 `true`/`false`/`null`（未体检），
+     附 `workmom_checked_at`，未体检的注「尚未体检，状态未知」，不再让人对"没字段"瞎猜；
+  5. `server.py` 查台账的键统一走归一（`_norm`：去空白、去 provider 前缀），
+     原来裸模型名取键，遇到 `xxx/provider` 这类写法会整条查不到。
+- 实测：
+  - `POST /admin/model_check {"models":["hy4-free"]}` → `alive:false`、`code:fallback`、
+    `msg:"请求被静默降级到 kimi-k3.1-pro（本模型不可用）"`；
+  - 点名 `X-WM-Model: hy4-free` 请求 → HTTP 200、`body.model=kimi-k3.1-pro`、
+    `X-WM-Model-Used: kimi-k3.1-pro`、`X-WM-Model-Fallback: 1`（客户端能看出被偷换）；
+  - 台账 12 个模型：判死 1 个（`hy4-free`），其余 11 个存活；
+  - 重启三进程后全量验收 **PASS 12 / FAIL 0**，离线单测 **PASS 25 / FAIL 0**。
+
 ## 0.5.3 — 2026-11-14
 
 **旧额度快照冒充当下：好号被误判「额度耗尽」、反代还把它塞给客户端**
