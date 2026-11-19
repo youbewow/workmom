@@ -429,6 +429,11 @@ python workmom_guard.py --quota-check
 两个头都在 CORS `Access-Control-Expose-Headers` 里，浏览器端也读得到。客户端想确认自己点名的模型
 到底有没有被满足，看 `X-WM-Model-Used` 就行，不用再靠猜。
 
+> **0.5.5 起流式也带头。** 之前只有非流式带 `X-WM-Model-Used`，`stream:true` 的请求一个头都不带 ——
+> 于是「流式请求被静默降级」这件事客户端完全看不见，`probe_model` 也只好退回读响应体。
+> 现在 `/v1/chat/completions`、`/v1/messages`、`/v1/responses` 的**流式与非流式**都是先发头再吐数据，
+> 三协议 × 两种模式 = 6 个出口一个不漏，头名与语义完全一致。
+
 ### 台账与接口
 
 - 台账文件：`data/model_health.json`，记录每个模型 `alive` / `code` / `msg` / `checked_at` / `source`。
@@ -450,6 +455,12 @@ python workmom_guard.py --quota-check
 
 面板侧还有两道闸：**切模型前先探活，已下线直接拒绝**（提示「✘ 已不可用，没切」）；
 模型表里已下线的模型标红并注明「（已下线）」。
+
+> **0.5.5 起体检是全量，不再截断。** 0.5.4 的 `refresh_model_health` 内部把候选队列砍到 `limit=6`，
+> 死模型只能靠「插队」挤进来 —— 白名单里的存活模型一旦超过 6 个，排在第 7 位之后的死模型**永远探不到**
+> （`hy4-free` 就是这么漏的：台账里它排第 9）。现在 `limit` 默认 `0` = 不截断，且**已判死的模型进 `must`
+> 集合强制必探**，白名单多长都不会被挤掉。12 个已知模型全量探一遍约 34 秒，走后台线程，不挡请求。
+> 另外 `config.json` 补了 `known_models`（12 个）+ `model_probe_timeout`，探活队列不再依赖「碰巧配了白名单」。
 
 ### 常用命令
 

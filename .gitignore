@@ -9,6 +9,7 @@ rate_limit_ledger.json
 data/
 logs/
 backups/
+backup_*/
 
 # ---- 历史遗留 ----
 dashboard_K31_old.py

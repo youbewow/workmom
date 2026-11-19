@@ -1360,6 +1360,22 @@ _load_usage()
 # ----------------------------------------------------------------------------
 # 额度快照 → 响应头：客户端不用额外探测就知道还剩多少，守护进程也靠它判断阈值
 # ----------------------------------------------------------------------------
+def _model_hd(used, client_model=None):
+    """统一构造「实际落地模型」响应头（非流式 / 流式 / 三种协议共用一份契约）。
+
+    X-WM-Model-Used     ：这一轮真正干活的模型
+    X-WM-Model-Fallback ：1 表示客户端点名的模型和实际用的不是一个（反代降级了）
+    """
+    used = str(used or "").strip()
+    if not used:
+        return {}
+    hd = {"X-WM-Model-Used": used}
+    cm = str(client_model or "").strip()
+    if cm and _norm(used) != _norm(cm):
+        hd["X-WM-Model-Fallback"] = "1"
+    return hd
+
+
 def _quota_headers(extra=None):
     hdrs = dict(extra or {})
     try:
@@ -1587,15 +1603,22 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return self._json(err.http, body, hdrs)
 
-    def _begin_stream(self):
+    def _begin_stream(self, used="", client_model=""):
+        """流式响应头。used/client_model 用来标记「点名 A 实际 B 在干活」的降级事实。
+
+        0.5.5：以前流式路径一个 X-WM-Model-* 头都不带，客户端（含 probe_model）
+        只能从 chunk 里猜；非流式早就有这两个头，流式补齐同一契约。
+        """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Expose-Headers",
-                         "X-WM-Quota-Percent,X-WM-Quota-Reset,X-WM-Quota-Model,X-WM-Quota-Near-Limit")
-        for k, v in _quota_headers().items():
+                         "X-WM-Quota-Percent,X-WM-Quota-Reset,X-WM-Quota-Model,X-WM-Quota-Near-Limit,"
+                         "X-WM-Model-Used,X-WM-Model-Fallback")
+        hd = _model_hd(used, client_model)
+        for k, v in _quota_headers(hd).items():
             self.send_header(k, str(v))
         self.end_headers()
 
@@ -1891,7 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if want_stream:
-                self._begin_stream()
+                self._begin_stream(used=model, client_model=client_model)
                 res = self._pump(st, protocol, client_model)
             else:
                 res = self._collect_direct(st, client_model)
@@ -1911,9 +1934,7 @@ class Handler(BaseHTTPRequestHandler):
         # used = 这一轮真正干活的模型（循环变量 model 会在降级时被改写）；
         # client_model = 一开始想要的那个。两者不一致就说明中途换过模型，必须让客户端看见。
         used = str(model or client_model or "")
-        hd = {"X-WM-Model-Used": used}
-        if used and client_model and _norm(used) != _norm(client_model):
-            hd["X-WM-Model-Fallback"] = "1"
+        hd = _model_hd(used, client_model)
         if protocol == "anthropic":
             self._json(200, RP.openai_to_anthropic(res, model), hd)
         elif protocol == "responses":
@@ -1948,10 +1969,11 @@ class Handler(BaseHTTPRequestHandler):
         _note_usage(cmodel, usage, "chat")
 
         if not want_stream:
-            self._json(200, _openai_completion_body(res, cmodel, client_model))
+            self._json(200, _openai_completion_body(res, cmodel, client_model),
+                       _model_hd(cmodel, client_model))
             return
 
-        self._begin_stream()
+        self._begin_stream(used=cmodel, client_model=client_model)
         try:
             self.wfile.write(_sse({"id": cid, "object": "chat.completion.chunk",
                                    "created": int(time.time()), "model": cmodel,
@@ -1985,9 +2007,10 @@ class Handler(BaseHTTPRequestHandler):
         _bump("anthropic")
         oai_req, meta = RP.anthropic_to_openai(req)
         want_stream = bool(meta["stream"])
+        client_model = req.get("model") or _active_model()
 
         done, _e = self._try_direct(oai_req, self.headers.get("X-WM-Model"),
-                                    "anthropic", want_stream, req.get("model") or _active_model())
+                                    "anthropic", want_stream, client_model)
         if done:
             return
 
@@ -1998,9 +2021,10 @@ class Handler(BaseHTTPRequestHandler):
         _note_usage(model, res.get("usage"), "anthropic")
 
         if not want_stream:
-            return self._json(200, RP.openai_to_anthropic(res, model))
+            return self._json(200, RP.openai_to_anthropic(res, model),
+                              _model_hd(model, client_model))
 
-        self._begin_stream()
+        self._begin_stream(used=model, client_model=client_model)
         try:
             for name, data in RP.anthropic_stream_events(res, model):
                 self.wfile.write(_sse_named(name, data))
@@ -2014,9 +2038,10 @@ class Handler(BaseHTTPRequestHandler):
         _bump("responses")
         oai_req, meta = RP.responses_to_openai(req)
         want_stream = bool(meta["stream"])
+        client_model = req.get("model") or _active_model()
 
         done, _e = self._try_direct(oai_req, self.headers.get("X-WM-Model"),
-                                    "responses", want_stream, req.get("model") or _active_model())
+                                    "responses", want_stream, client_model)
         if done:
             return
 
@@ -2027,9 +2052,10 @@ class Handler(BaseHTTPRequestHandler):
         _note_usage(model, res.get("usage"), "responses")
 
         if not want_stream:
-            return self._json(200, RP.openai_to_responses(res, model))
+            return self._json(200, RP.openai_to_responses(res, model),
+                              _model_hd(model, client_model))
 
-        self._begin_stream()
+        self._begin_stream(used=model, client_model=client_model)
         try:
             for name, data in RP.responses_stream_events(res, model):
                 self.wfile.write(_sse_named(name, data))

@@ -1,5 +1,51 @@
 # 更新记录
 
+## 0.5.5 — 2026-11-19
+
+**体检只探前 6 个，流式降级不吭声：模型死了，台账却写了「存活」**
+
+0.5.4 的自愈只在「模型数量少」时成立。真跑起来三处漏：探活队列被 `limit=6` 硬截、死模型排到第 9 位就
+再也探不到；流式响应一个 `X-WM-Model-*` 头都不带，点名已下线模型被静默降级到别人，客户端拿到 200
+还以为自己点名的模型活着；`config.json` 里根本没有 `known_models`，队列全靠「碰巧配了白名单」。
+
+- 现象：`hy4-free` 上游下线后，`data/model_health.json` 里它一直挂着 `alive:true`（因为压根没被探），
+  `/v1/models` 报告「存活」、面板不标红、`--model-check` 探不出问题；流式请求被换模型后
+  `X-WM-Model-Fallback` 缺失，客户端与 `probe_model` 双双失明。
+- 根因三处：
+  1. `refresh_model_health()` 内部 `cands = cands[:limit]`，`limit` 默认 6 —— 队列按
+     「当前模型 → known_models → default → fallback → 内置」排，**已判死的模型不会自动插队**，
+     白名单一长就被挤到截断线外，永远轮不到它；
+  2. `_begin_stream()` 只发额度头，不发模型头；`_try_direct` 的非流式分支带了、`chat` 的收尾出口
+     `_openai_completion_body` 又漏带 —— 六个出口（三协议 × 流式/非流式）只覆盖了不到一半；
+  3. `known_models` 缺失 → 白名单退化成 `fallback_models`，队列与 `/v1/models` 都不完整。
+
+- 现在：
+  - `workmom_core.py`
+    - `refresh_model_health(models=None, allow_switch=True, reason="manual", limit=0)` —— **`limit` 默认 0 = 不截断**；
+      旧逻辑保留（显式传 `limit` 仍生效，只是没人再传）。
+    - 候选队列新增 `must` 集合：**当前模型 + 台账里已判死的模型一律强制入队必探**，排在最前面，
+      白名单再长也不会被截掉。`probe_timeout` 改读 `config.json` 的 `model_probe_timeout`（默认 45s）。
+    - `probe_model()` 判活口径升级：响应体 `model` 与探测名不一致 → 再看响应头 `X-WM-Model-Used`，
+      仍不一致即判死（`code=fallback`，备注「请求被静默降级到 X（本模型不可用）」）。
+  - `server.py`
+    - 新增 `_model_hd(used, client_model)` 统一生成 `X-WM-Model-Used` / `X-WM-Model-Fallback:1`（仅在
+      「点名 A、实际用 B」时打 Fallback）；
+    - `_begin_stream()` 先发头再吐数据，流式三协议全覆盖；
+    - 非流式出口补全：`chat` 的 `_openai_completion_body` 收尾、`_try_direct` 的三个返回点、
+      `anthropic_messages`、`responses_api` 全部带 `_model_hd` —— 6 个出口一个不漏；
+    - 两处 `Access-Control-Expose-Headers`（`_json` 与 `_begin_stream`）都补上这两个头名，浏览器端读得到。
+  - `config.json`：补 `known_models`（12 个：含 `hy4-free`）+ `model_probe_timeout: 45`。
+  - `dashboard.py` / `workmom_guard.py` / `server.py` 三处 `refresh_model_health` 调用不再传 `limit`，
+    全量探活对「首登 / 手动 / 周期」三个时机一并生效。
+
+- 实测（本次改完当场验证）：
+  - 静态审计 4 组：推理出口 6 个全部带头、`_begin_stream` 4 个调用点全部带 `used`、
+    两处 Expose-Headers 均含两个头名、四处调用点均未传 `limit`；
+  - 实机 12 用例（三协议 × 流式/非流式 × 直连/降级）：直连 6 项 `Used=实际模型 / Fallback=空`，
+    降级 6 项 `Used=kimi-k3.1-pro / Fallback=1`，**12/12 PASS**；
+  - 全量探活 12 个模型退出码 0，`/admin/model_check` 回 12 条台账，`hy4-free` 正确判死（`code=fallback`）；
+  - `tests/test_relay.py` 连跑 3 次，13/13、12/13（时序抖动）、13/13 —— 抖动项为流式时序断言，与本次改动无关。
+
 ## 0.5.4 — 2026-11-17
 
 **模型被上游下线，程序却当它还活着：11102 不降级、面板能切死模型、没有存活自检**

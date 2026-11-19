@@ -1630,7 +1630,7 @@ def probe_model(model, timeout=None):
             except Exception:
                 used = ""
             if not used:
-                # 没回显就看响应头（0.5.4 起反代会带 X-WM-Model-Used）
+                # 没回显就看响应头（0.5.5 起流式/非流式都带 X-WM-Model-Used）
                 used = str(r.headers.get("X-WM-Model-Used") or "").strip()
         out["used"] = used
         if used and _norm_model(used) != _norm_model(model):
@@ -1662,27 +1662,48 @@ def probe_model(model, timeout=None):
     return out
 
 
-def refresh_model_health(models=None, allow_switch=True, reason="manual", limit=6):
+def refresh_model_health(models=None, allow_switch=True, reason="manual", limit=0):
     """探测并刷新模型体检台账；当前模型已下线时不声不响地回退到还能用的那个。
 
-    models 为空时按「当前模型 → known_models → default_model → fallback_models」自己排队。
+    models 为空时按「当前模型 → 台账里已判死/最久没复探的 → known_models
+    → default_model → fallback_models」自己排队。
     allow_switch=False 只体检不换模型（给面板做"切之前先验一下"用）。
+    limit<=0（默认）表示不设上限，全量探；正数只作兜底上限，但当前模型与台账里
+    已判死的模型永远必探，不会被截掉——0.5.4 那版 limit=6 硬截断，排在第 9 位的
+    hy4-free 永远轮不到复探，这是"hy4 明明又免费了却一直没被重新探到"的根因。
     返回 {"checked_at","current","current_alive","switched_to","results"}
     """
     c = cfg()
     cur = active_model()
     cands = []
+    must = set()
 
     def _add(m):
         m = str(m or "").strip().split("/")[-1].strip()
         if m and m not in cands:
             cands.append(m)
+        return m
 
     _add(cur)
+    must.add(_norm_model(cur))
     if models:
         for m in models:
             _add(m)
     else:
+        # 台账里 alive=False 的、以及最久没探过的，插到队首附近优先复探：
+        # 死模型不该因为"排在 known_models 第 N 位"就永远轮不到。
+        try:
+            ms = (model_health() or {}).get("models") or {}
+        except Exception:
+            ms = {}
+        stale = sorted(
+            [(k, v if isinstance(v, dict) else {}) for k, v in ms.items()],
+            key=lambda kv: (0 if kv[1].get("alive") is False else 1,
+                            kv[1].get("at") or 0))
+        for k, v in stale:
+            m = _add(k)
+            if m and v.get("alive") is False:
+                must.add(_norm_model(m))     # 判死的必须复探，不能因为名额被砍
         for m in (c.get("known_models") or []):
             _add(m)
         _add(c.get("default_model"))
@@ -1690,8 +1711,10 @@ def refresh_model_health(models=None, allow_switch=True, reason="manual", limit=
             _add(m)
         _add("kimi-k3.1-pro")
         _add("kimi-k3-2")
-    if limit and len(cands) > limit:
-        cands = cands[:limit]
+    if limit and limit > 0 and len(cands) > limit:
+        keep = [m for m in cands if _norm_model(m) in must]
+        rest = [m for m in cands if _norm_model(m) not in must]
+        cands = (keep + rest)[:max(int(limit), len(keep))]
 
     results = [probe_model(m) for m in cands]
     now = int(time.time())
